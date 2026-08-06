@@ -6,7 +6,15 @@ import * as vscode from 'vscode';
 import simpleGit, { SimpleGit } from 'simple-git';
 import type { API as GitAPI, GitExtension, Repository as VscodeGitRepo, Change } from './api/git';
 import { Status } from './api/gitStatus';
+import { parseUnifiedDiff } from './hunks';
 import { ChangeKind, GitFileChange, RepoRelativePath, ShelvedFile } from './types';
+
+/** One file's contribution to a scoped commit. `partialPatch` is set only when the
+ *  changelist owns a subset of the file's hunks; otherwise the whole file is staged. */
+export interface ScopedCommitFile {
+  readonly filePath: RepoRelativePath;
+  readonly partialPatch?: string;
+}
 
 /** Reads live status via the built-in vscode.git extension's API (source of truth for
  *  "what's modified" — PRD §7.3), and performs staging/commit via the git CLI (simple-git)
@@ -138,6 +146,92 @@ export class GitRepository {
     }
     args.push('--', ...paths);
     await this.git.raw(args);
+  }
+
+  /** Unified diff of one file against HEAD. `-U3` and `--no-color` are explicit rather
+   *  than inherited so a user's `diff.context`/`color.ui` config can't change the shape
+   *  of what we parse into hunks. `--no-ext-diff` keeps a configured external difftool
+   *  from replacing the machine-readable output entirely. */
+  async getFileDiff(filePath: RepoRelativePath): Promise<string> {
+    return this.git.diff(['--no-color', '--no-ext-diff', '-U3', 'HEAD', '--', filePath]);
+  }
+
+  /** Builds the hunkId index the manager needs for split rendering/reconciliation.
+   *  Only `modified` files can be split: added/untracked files have no HEAD blob to
+   *  diff against, and deleted/renamed files have no meaningful partial state — the UI
+   *  refuses to split those, so there's no point paying for their diffs here. */
+  async buildHunkIndex(entries: readonly GitFileChange[]): Promise<Map<RepoRelativePath, string[]>> {
+    const index = new Map<RepoRelativePath, string[]>();
+    const splittable = entries.filter((e) => e.kind === 'modified');
+    await Promise.all(
+      splittable.map(async (entry) => {
+        try {
+          const parsed = parseUnifiedDiff(await this.getFileDiff(entry.filePath));
+          if (parsed) {
+            index.set(entry.filePath, parsed.hunks.map((h) => h.id));
+          }
+        } catch {
+          // A file we can't diff simply isn't splittable; it still renders whole.
+        }
+      })
+    );
+    return index;
+  }
+
+  /** Commits a changelist whose files include at least one *partially* selected file.
+   *
+   *  A pathspec commit can't express "only these hunks of this file", so this builds the
+   *  commit through the index instead: reset the index to HEAD, stage exactly what the
+   *  changelist owns (whole files via `add`, partial files via `apply --cached`), then
+   *  commit with no pathspec so the commit is precisely the index we just constructed.
+   *
+   *  The cost is that any *unrelated* staging the user had is cleared — the index is a
+   *  single global slot and there's no way to build a different tree without disturbing
+   *  it. No content is lost (working-tree files are never touched here, and `--cached`
+   *  keeps the partial application index-only), but the user's staging bookkeeping is
+   *  reset, so commitChangelistCommand warns before taking this path. On failure the
+   *  original index is restored from the tree snapshot taken up front. */
+  async commitScopedWithHunks(
+    files: readonly ScopedCommitFile[],
+    message: string,
+    options: { amend?: boolean } = {}
+  ): Promise<void> {
+    if (files.length === 0) {
+      throw new Error('Cannot commit an empty changelist.');
+    }
+    const savedIndexTree = (await this.git.raw(['write-tree'])).trim();
+    let committed = false;
+    try {
+      await this.git.raw(['read-tree', 'HEAD']);
+      for (const file of files) {
+        if (file.partialPatch) {
+          await this.applyPatchToIndex(file.partialPatch);
+        } else {
+          await this.git.raw(['add', '--', file.filePath]);
+        }
+      }
+      const args = ['commit', '-m', message];
+      if (options.amend) {
+        args.splice(1, 0, '--amend');
+      }
+      await this.git.raw(args);
+      committed = true;
+    } finally {
+      if (!committed) {
+        // Roll the index back to exactly what the user had before we touched it.
+        await this.git.raw(['read-tree', savedIndexTree]).catch(() => undefined);
+      }
+    }
+  }
+
+  private async applyPatchToIndex(patch: string): Promise<void> {
+    const tmpFile = path.join(os.tmpdir(), `changelists-${randomUUID()}.patch`);
+    await fs.writeFile(tmpFile, patch, 'utf8');
+    try {
+      await this.git.raw(['apply', '--cached', '--whitespace=nowarn', tmpFile]);
+    } finally {
+      await fs.rm(tmpFile, { force: true });
+    }
   }
 
   /** WebStorm-style shelve: snapshots each file as either a unified diff against HEAD

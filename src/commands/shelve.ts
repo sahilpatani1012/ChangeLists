@@ -35,9 +35,22 @@ export async function shelveChangelistCommand(
     return;
   }
 
-  const entries = context.manager.getFilesGroupedByChangelist(context.liveChanges).get(changelist.id) ?? [];
+  const entries =
+    context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex).get(changelist.id) ?? [];
   if (entries.length === 0) {
     void vscode.window.showInformationMessage(`"${changelist.name}" has no files to shelve.`);
+    return;
+  }
+
+  // Shelving works at whole-file granularity: it reverts paths in the working tree, and
+  // a file whose hunks are split would drag another changelist's hunks out of the tree
+  // with it. Refuse rather than silently over-reach.
+  const partial = entries.filter((e) => e.split && e.split.ownedHunks < e.split.totalHunks);
+  if (partial.length > 0) {
+    void vscode.window.showErrorMessage(
+      `"${changelist.name}" owns only part of ${partial.length === 1 ? `"${partial[0].filePath}"` : `${partial.length} files`}. ` +
+        'Reunite the split hunks before shelving, so another changelist\'s work is not shelved along with it.'
+    );
     return;
   }
 

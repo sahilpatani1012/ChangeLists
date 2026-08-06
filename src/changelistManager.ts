@@ -5,6 +5,8 @@ import {
   ChangelistFileEntry,
   ChangelistState,
   GitFileChange,
+  HunkAssignment,
+  HunkIndex,
   ReconciliationResult,
   RepoRelativePath,
   ShelfInfo,
@@ -145,10 +147,16 @@ export class ChangelistManager {
     });
     const wasActive = target.isActive;
     this._state = {
+      ...this._state,
       changelists: this._state.changelists
         .filter((c) => c.id !== id)
         .map((c) => (wasActive && c.id === defaultList.id ? { ...c, isActive: true } : c)),
       assignments: nextAssignments,
+      // The deleted list's files moved to Default, so their hunk overrides must follow
+      // rather than dangle at a changelist id that no longer exists.
+      hunkAssignments: (this._state.hunkAssignments ?? []).map((h) =>
+        h.changelistId === id ? { ...h, changelistId: defaultList.id } : h
+      ),
     };
     this.notify();
     return { movedFilePaths };
@@ -193,6 +201,7 @@ export class ChangelistManager {
     const defaultList = this.getDefaultChangelist();
     const wasActive = target.isActive;
     this._state = {
+      ...this._state,
       changelists: this._state.changelists.map((c) => {
         if (c.id === id) {
           return { ...c, shelf, isActive: false };
@@ -203,6 +212,10 @@ export class ChangelistManager {
         return c;
       }),
       assignments: this._state.assignments.filter((a) => a.changelistId !== id),
+      // Shelving is refused for partially-owned files (see commands/shelve.ts), so the
+      // only overrides referencing this list are ones whose file it owns outright;
+      // drop them with the assignments they belonged to.
+      hunkAssignments: (this._state.hunkAssignments ?? []).filter((h) => h.changelistId !== id),
     };
     this.notify();
   }
@@ -224,6 +237,7 @@ export class ChangelistManager {
     }));
     const restoredPaths = new Set(restored.map((r) => r.filePath));
     this._state = {
+      ...this._state,
       changelists: this._state.changelists.map((c) =>
         c.id === id ? { ...c, shelf: undefined } : c
       ),
@@ -231,6 +245,9 @@ export class ChangelistManager {
       // list (the user modified the file again while it was shelved) — the unshelved
       // list wins, since the user explicitly asked for its contents back.
       assignments: [...this._state.assignments.filter((a) => !restoredPaths.has(a.filePath)), ...restored],
+      // Likewise for hunk overrides on those paths: the shelved snapshot is whole-file,
+      // so any split created while it was away no longer describes this content.
+      hunkAssignments: (this._state.hunkAssignments ?? []).filter((h) => !restoredPaths.has(h.filePath)),
     };
     this.notify();
     return shelf;
@@ -317,8 +334,16 @@ export class ChangelistManager {
   /** Pure view-builder: groups the latest git-status snapshot by changelist for
    *  rendering. Call reconcile() first — entries for paths not present in `liveChanges`
    *  are silently skipped rather than shown stale, since reconcile() is what's
-   *  responsible for dropping/carrying over assignments that no longer match reality. */
-  getFilesGroupedByChangelist(liveChanges: readonly GitFileChange[]): Map<string, ChangelistFileEntry[]> {
+   *  responsible for dropping/carrying over assignments that no longer match reality.
+   *
+   *  Passing `hunkIndex` enables split rendering: a file whose hunks span several
+   *  changelists yields one entry per owning changelist. Omit it (or pass an index
+   *  without that file) and every file renders whole, which is what the status-bar and
+   *  commit-count paths want. */
+  getFilesGroupedByChangelist(
+    liveChanges: readonly GitFileChange[],
+    hunkIndex?: HunkIndex
+  ): Map<string, ChangelistFileEntry[]> {
     const byPath = new Map(liveChanges.map((c) => [c.filePath, c]));
     const grouped = new Map<string, ChangelistFileEntry[]>();
     for (const cl of this._state.changelists) {
@@ -341,12 +366,132 @@ export class ChangelistManager {
       if (!change) {
         continue;
       }
-      const list = grouped.get(assignment.changelistId);
-      if (!list) {
+      const allHunks = hunkIndex?.get(assignment.filePath);
+      const overrides = this.hunkOverridesFor(assignment.filePath);
+
+      if (!allHunks || overrides.size === 0) {
+        // Not split: the file belongs wholly to its assigned changelist.
+        grouped.get(assignment.changelistId)?.push({ ...change, changelistId: assignment.changelistId });
         continue;
       }
-      list.push({ ...change, changelistId: assignment.changelistId });
+
+      // Split: bucket every hunk by its effective owner (explicit override, else the
+      // file-level assignment) and emit one row per owning changelist.
+      const byOwner = new Map<string, string[]>();
+      for (const hunkId of allHunks) {
+        const owner = overrides.get(hunkId) ?? assignment.changelistId;
+        const bucket = byOwner.get(owner);
+        if (bucket) {
+          bucket.push(hunkId);
+        } else {
+          byOwner.set(owner, [hunkId]);
+        }
+      }
+      for (const [changelistId, hunkIds] of byOwner) {
+        grouped.get(changelistId)?.push({
+          ...change,
+          changelistId,
+          split: { hunkIds, ownedHunks: hunkIds.length, totalHunks: allHunks.length },
+        });
+      }
     }
     return grouped;
+  }
+
+  // ---- hunk-level splitting (PRD §10 v2) ------------------------------------------
+
+  private get hunkAssignments(): readonly HunkAssignment[] {
+    return this._state.hunkAssignments ?? [];
+  }
+
+  /** hunkId → changelistId for one file, covering only hunks explicitly moved away
+   *  from the file's own changelist. */
+  private hunkOverridesFor(filePath: RepoRelativePath): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const h of this.hunkAssignments) {
+      if (h.filePath === filePath) {
+        map.set(h.hunkId, h.changelistId);
+      }
+    }
+    return map;
+  }
+
+  getHunkOverrides(filePath: RepoRelativePath): ReadonlyMap<string, string> {
+    return this.hunkOverridesFor(filePath);
+  }
+
+  /** True once at least one of `filePath`'s hunks lives in a different changelist than
+   *  the file itself. */
+  isSplit(filePath: RepoRelativePath): boolean {
+    const fileOwner = this.getChangelistIdForFile(filePath);
+    return this.hunkAssignments.some((h) => h.filePath === filePath && h.changelistId !== fileOwner);
+  }
+
+  /** Moves specific hunks of `filePath` into `changelistId`. Hunks landing back on the
+   *  file's own changelist drop their override rather than being stored redundantly,
+   *  which is what lets isSplit() stay honest and lets a fully-reunited file return to
+   *  the cheap non-split rendering path. */
+  assignHunks(filePath: RepoRelativePath, hunkIds: readonly string[], changelistId: string): void {
+    const target = this.getChangelist(changelistId);
+    if (!target) {
+      throw new Error('Changelist not found.');
+    }
+    if (target.shelf) {
+      throw new Error(`"${target.name}" is shelved; unshelve it before moving hunks into it.`);
+    }
+    const fileOwner = this.getChangelistIdForFile(filePath);
+    if (!fileOwner) {
+      throw new Error('That file is not in any changelist yet.');
+    }
+    const moving = new Set(hunkIds);
+    const kept = this.hunkAssignments.filter((h) => h.filePath !== filePath || !moving.has(h.hunkId));
+    const added: HunkAssignment[] =
+      changelistId === fileOwner ? [] : hunkIds.map((hunkId) => ({ filePath, hunkId, changelistId }));
+
+    this._state = { ...this._state, hunkAssignments: [...kept, ...added] };
+    this.notify();
+  }
+
+  /** Reunites every hunk of `filePath` under the file's own changelist. */
+  clearHunkAssignments(filePath: RepoRelativePath): void {
+    if (!this.hunkAssignments.some((h) => h.filePath === filePath)) {
+      return;
+    }
+    this._state = {
+      ...this._state,
+      hunkAssignments: this.hunkAssignments.filter((h) => h.filePath !== filePath),
+    };
+    this.notify();
+  }
+
+  /** Drops hunk overrides whose hunk no longer exists in the file's current diff, or
+   *  whose file/changelist has gone away.
+   *
+   *  Hunk ids are content-derived (see hunks.ts), so editing a hunk changes its id and
+   *  the override is dropped — the hunk falls back to the file's changelist rather than
+   *  being silently attributed to a list the user last chose for *different* content.
+   *  That is the deliberate conservative choice called for by PRD §12's "defensive
+   *  fallback rather than dropping data" guidance: the file itself keeps its assignment,
+   *  only the finer-grained override lapses. */
+  reconcileHunks(hunkIndex: HunkIndex): { droppedHunkAssignments: HunkAssignment[] } {
+    const dropped: HunkAssignment[] = [];
+    const kept: HunkAssignment[] = [];
+    const liveChangelistIds = new Set(this._state.changelists.map((c) => c.id));
+
+    for (const h of this.hunkAssignments) {
+      const hunksForFile = hunkIndex.get(h.filePath);
+      const stillExists = hunksForFile?.includes(h.hunkId) ?? false;
+      if (stillExists && liveChangelistIds.has(h.changelistId) && this.getChangelistIdForFile(h.filePath)) {
+        kept.push(h);
+      } else {
+        dropped.push(h);
+      }
+    }
+
+    if (dropped.length > 0) {
+      this._state = { ...this._state, hunkAssignments: kept };
+      this.notify();
+    }
+    return { droppedHunkAssignments: dropped };
   }
 }

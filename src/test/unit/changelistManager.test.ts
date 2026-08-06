@@ -271,6 +271,144 @@ test('a shelved changelist refuses deletion and refuses incoming files', () => {
   assert.throws(() => manager.assignFile('src/new.ts', feature.id), /unshelve it before moving/i);
 });
 
+// ---- hunk-level splitting (v2) ------------------------------------------------------
+
+const HUNKS = ['h1', 'h2', 'h3'];
+const hunkIndex = (filePath = 'src/a.ts', ids: string[] = HUNKS) => new Map([[filePath, ids]]);
+
+test('a file with no hunk overrides renders whole, even when a hunk index is supplied', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFile('src/a.ts', feature.id);
+
+  const grouped = manager.getFilesGroupedByChangelist([change('src/a.ts', 'modified')], hunkIndex());
+
+  assert.equal(grouped.get(feature.id)?.length, 1);
+  assert.equal(grouped.get(feature.id)?.[0].split, undefined);
+  assert.equal(manager.isSplit('src/a.ts'), false);
+});
+
+test('splitting a file makes it appear under both changelists with its own hunk share', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  manager.assignFile('src/a.ts', feature.id);
+
+  manager.assignHunks('src/a.ts', ['h2'], bugfix.id);
+
+  const grouped = manager.getFilesGroupedByChangelist([change('src/a.ts', 'modified')], hunkIndex());
+  const featureRow = grouped.get(feature.id)?.[0];
+  const bugfixRow = grouped.get(bugfix.id)?.[0];
+
+  assert.equal(manager.isSplit('src/a.ts'), true);
+  assert.deepEqual(featureRow?.split, { hunkIds: ['h1', 'h3'], ownedHunks: 2, totalHunks: 3 });
+  assert.deepEqual(bugfixRow?.split, { hunkIds: ['h2'], ownedHunks: 1, totalHunks: 3 });
+});
+
+test('moving hunks back to the file\'s own changelist drops the override entirely', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.assignHunks('src/a.ts', ['h2'], bugfix.id);
+
+  manager.assignHunks('src/a.ts', ['h2'], feature.id);
+
+  assert.equal(manager.isSplit('src/a.ts'), false);
+  assert.equal(manager.state.hunkAssignments?.length, 0);
+  // ...and the file is back to rendering as one whole row.
+  const grouped = manager.getFilesGroupedByChangelist([change('src/a.ts', 'modified')], hunkIndex());
+  assert.equal(grouped.get(feature.id)?.[0].split, undefined);
+});
+
+test('clearHunkAssignments reunites a split file', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.assignHunks('src/a.ts', ['h1', 'h2'], bugfix.id);
+  assert.equal(manager.isSplit('src/a.ts'), true);
+
+  manager.clearHunkAssignments('src/a.ts');
+
+  assert.equal(manager.isSplit('src/a.ts'), false);
+});
+
+test('reconcileHunks drops overrides whose hunk no longer exists', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.assignHunks('src/a.ts', ['h2', 'h3'], bugfix.id);
+
+  // The user edited the region h3 covered, so its content hash — and thus its id —
+  // changed. h2 is untouched and must survive.
+  const { droppedHunkAssignments } = manager.reconcileHunks(hunkIndex('src/a.ts', ['h1', 'h2', 'h9-new']));
+
+  assert.equal(droppedHunkAssignments.length, 1);
+  assert.equal(droppedHunkAssignments[0].hunkId, 'h3');
+  assert.equal(manager.getHunkOverrides('src/a.ts').get('h2'), bugfix.id);
+  // The edited hunk falls back to the file's own changelist rather than vanishing.
+  const grouped = manager.getFilesGroupedByChangelist(
+    [change('src/a.ts', 'modified')],
+    hunkIndex('src/a.ts', ['h1', 'h2', 'h9-new'])
+  );
+  assert.deepEqual(grouped.get(feature.id)?.[0].split?.hunkIds, ['h1', 'h9-new']);
+});
+
+test('deleting a changelist moves its hunk overrides to Default rather than orphaning them', () => {
+  // Mirrors the file-level rule (deletion moves work to Default, never discards it):
+  // the hunk keeps its separate identity, now grouped under Default.
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.assignHunks('src/a.ts', ['h2'], bugfix.id);
+
+  manager.deleteChangelist(bugfix.id);
+
+  const defaultId = manager.getDefaultChangelist().id;
+  assert.equal(manager.getHunkOverrides('src/a.ts').get('h2'), defaultId);
+  assert.equal(manager.isSplit('src/a.ts'), true);
+  // It survives reconciliation too — the changelist it now points at is live.
+  assert.equal(manager.reconcileHunks(hunkIndex()).droppedHunkAssignments.length, 0);
+
+  const grouped = manager.getFilesGroupedByChangelist([change('src/a.ts', 'modified')], hunkIndex());
+  assert.deepEqual(grouped.get(defaultId)?.[0].split?.hunkIds, ['h2']);
+  assert.deepEqual(grouped.get(feature.id)?.[0].split?.hunkIds, ['h1', 'h3']);
+});
+
+test('mutating one changelist never discards unrelated hunk overrides', () => {
+  // Regression guard: state is rebuilt as a fresh object on every mutation, and an
+  // object literal that forgets to carry hunkAssignments over wipes every split in the
+  // repo — silently, since nothing else reads it until the next render.
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  const doomed = manager.createChangelist('Doomed');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.assignHunks('src/a.ts', ['h2'], bugfix.id);
+
+  manager.deleteChangelist(doomed.id);
+  assert.equal(manager.getHunkOverrides('src/a.ts').get('h2'), bugfix.id);
+
+  manager.renameChangelist(feature.id, 'Renamed');
+  manager.setActiveChangelist(bugfix.id);
+  manager.assignFile('src/other.ts', feature.id);
+  assert.equal(manager.getHunkOverrides('src/a.ts').get('h2'), bugfix.id);
+});
+
+test('hunks cannot be moved into a shelved changelist', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const bugfix = manager.createChangelist('Bugfix');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.assignFile('src/b.ts', bugfix.id);
+  manager.shelveChangelist(bugfix.id, shelfFor([['src/b.ts', 'modified']]));
+
+  assert.throws(() => manager.assignHunks('src/a.ts', ['h1'], bugfix.id), /shelved/);
+});
+
 test('onDidChangeState fires on mutation and stops firing after dispose', () => {
   const manager = freshManager();
   let calls = 0;

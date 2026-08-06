@@ -22,7 +22,7 @@ export async function deleteChangelistCommand(
     return;
   }
 
-  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges);
+  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
   const fileCount = grouped.get(changelist.id)?.length ?? 0;
   const confirmOnNonEmpty = vscode.workspace
     .getConfiguration('changelists')

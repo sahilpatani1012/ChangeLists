@@ -4,7 +4,9 @@ import { createChangelistCommand } from './createChangelist';
 import { deleteChangelistCommand } from './deleteChangelist';
 import { discardChangesCommand, openDiffCommand, openFileCommand } from './fileActions';
 import { moveSelectionToChangelistCommand } from './moveFile';
+import { reuniteHunksCommand, splitHunksCommand } from './moveHunks';
 import { renameChangelistCommand } from './renameChangelist';
+import { reviewChangelistCommand } from './reviewChangelist';
 import { setActiveChangelistCommand, switchActiveChangelistCommand } from './setActiveChangelist';
 import { shelveChangelistCommand, unshelveChangelistCommand } from './shelve';
 import { collapseAllCommand, refreshCommand } from './view';
@@ -41,6 +43,9 @@ export function registerCommands(
   register('changelists.moveSelectionToChangelist', (node?: ChangelistTreeNode, selection?: ChangelistTreeNode[]) =>
     moveSelectionToChangelistCommand(provider, node, selection)
   );
+  register('changelists.reviewChangelist', (node?: ChangelistTreeNode) => reviewChangelistCommand(provider, node));
+  register('changelists.splitHunks', (node?: ChangelistTreeNode) => splitHunksCommand(provider, node));
+  register('changelists.reuniteHunks', (node?: ChangelistTreeNode) => reuniteHunksCommand(node));
   register('changelists.openFile', (node?: ChangelistTreeNode) => openFileCommand(node));
   register('changelists.openDiff', (node?: ChangelistTreeNode) => openDiffCommand(node));
   register('changelists.discardChanges', (node?: ChangelistTreeNode) => discardChangesCommand(node));

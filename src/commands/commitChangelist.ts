@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { errorMessage, resolveChangelistTarget } from './shared';
+import { buildSubsetPatch, parseUnifiedDiff } from '../hunks';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 
 /** "Commit Changelist…" — stages and commits exactly this changelist's files (PRD §7.3,
@@ -24,7 +25,7 @@ export async function commitChangelistCommand(
   }
   const { context, changelist } = target;
 
-  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges);
+  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
   const entries = grouped.get(changelist.id) ?? [];
   if (entries.length === 0) {
     void vscode.window.showInformationMessage(`"${changelist.name}" has no files to commit.`);
@@ -39,10 +40,20 @@ export async function commitChangelistCommand(
     }
   }
 
+  // A file this changelist owns only part of forces the index-rebuilding commit path,
+  // which cannot preserve unrelated staging (see gitService.commitScopedWithHunks).
+  const partialEntries = entries.filter((e) => e.split && e.split.ownedHunks < e.split.totalHunks);
+  const hasPartial = partialEntries.length > 0;
+
   const otherStaged = context.repo.getOtherStagedPaths(paths);
   if (otherStaged.length > 0) {
+    const consequence = hasPartial
+      ? `will be unstaged (their changes stay in your working tree) because "${changelist.name}" commits only part of ${
+          partialEntries.length === 1 ? 'a file' : 'some files'
+        }`
+      : `will be left staged, not committed`;
     const choice = await vscode.window.showWarningMessage(
-      `${otherStaged.length} other staged file${otherStaged.length === 1 ? ' is' : 's are'} outside "${changelist.name}" and will be left staged, not committed. Continue?`,
+      `${otherStaged.length} other staged file${otherStaged.length === 1 ? ' is' : 's are'} outside "${changelist.name}" and ${consequence}. Continue?`,
       { modal: true },
       'Continue'
     );
@@ -52,9 +63,12 @@ export async function commitChangelistCommand(
   }
 
   const fileWord = entries.length === 1 ? 'file' : 'files';
+  const scopeNote = hasPartial
+    ? `${entries.length} ${fileWord} (${partialEntries.length} partially)`
+    : `${entries.length} ${fileWord}`;
   const message = await vscode.window.showInputBox({
     title: `Commit: ${changelist.name}`,
-    prompt: `Commit message for ${entries.length} ${fileWord}`,
+    prompt: `Commit message for ${scopeNote}`,
     placeHolder: 'Summary of changes',
     validateInput: (v) => (v.trim().length === 0 ? 'Commit message cannot be empty.' : undefined),
   });
@@ -81,9 +95,29 @@ export async function commitChangelistCommand(
   try {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `Committing "${changelist.name}"…` },
-      () => context.repo.commitScoped([...paths], message, { amend })
+      async () => {
+        if (!hasPartial) {
+          return context.repo.commitScoped([...paths], message, { amend });
+        }
+        const scopedFiles = await Promise.all(
+          entries.map(async (e) => {
+            if (!e.split || e.split.ownedHunks === e.split.totalHunks) {
+              return { filePath: e.filePath };
+            }
+            const parsed = parseUnifiedDiff(await context.repo.getFileDiff(e.filePath));
+            const patch = parsed ? buildSubsetPatch(parsed, new Set(e.split.hunkIds)) : undefined;
+            if (!patch) {
+              throw new Error(
+                `Could not rebuild the selected hunks for "${e.filePath}" — the file may have changed since it was split.`
+              );
+            }
+            return { filePath: e.filePath, partialPatch: patch };
+          })
+        );
+        return context.repo.commitScopedWithHunks(scopedFiles, message, { amend });
+      }
     );
-    void vscode.window.showInformationMessage(`Committed ${entries.length} ${fileWord} to "${changelist.name}".`);
+    void vscode.window.showInformationMessage(`Committed ${scopeNote} to "${changelist.name}".`);
     const autoAssignToActive = vscode.workspace
       .getConfiguration('changelists')
       .get<boolean>('autoAssignNewFilesToActive', true);

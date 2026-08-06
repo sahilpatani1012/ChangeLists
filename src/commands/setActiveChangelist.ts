@@ -29,7 +29,7 @@ export async function switchActiveChangelistCommand(provider: ChangelistsTreeDat
   if (!context) {
     return;
   }
-  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges);
+  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
   const NEW_LIST = Symbol('new-list');
   type Item = vscode.QuickPickItem & { changelistId: string | typeof NEW_LIST };
 

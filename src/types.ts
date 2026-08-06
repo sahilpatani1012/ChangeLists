@@ -47,9 +47,22 @@ export interface ChangelistAssignment {
   changelistId: string;
 }
 
+/** Overrides the *file-level* assignment for one hunk (PRD §10 v2, hunk-level splitting).
+ *  Only exception-assignments are stored: a hunk with no entry here belongs to whichever
+ *  changelist owns the file. That keeps the common "file isn't split at all" case free of
+ *  per-hunk bookkeeping, and means a file's hunks can never all silently orphan
+ *  themselves if their ids drift. */
+export interface HunkAssignment {
+  filePath: RepoRelativePath;
+  hunkId: string;
+  changelistId: string;
+}
+
 export interface ChangelistState {
   changelists: Changelist[];
   assignments: ChangelistAssignment[];
+  /** Optional for backward compatibility with 0.x persisted state. */
+  hunkAssignments?: HunkAssignment[];
 }
 
 /** One file as currently reported by git status, prior to changelist grouping. */
@@ -61,13 +74,22 @@ export interface GitFileChange {
   readonly staged: boolean;
 }
 
-/** A file as it will be rendered under a changelist group in the tree. */
+/** A file as it will be rendered under a changelist group in the tree. When a file's
+ *  hunks are split across changelists it yields one entry per owning changelist, each
+ *  describing only that changelist's share via `split`. */
 export interface ChangelistFileEntry {
   readonly filePath: RepoRelativePath;
   readonly kind: ChangeKind;
   readonly renamedFrom?: RepoRelativePath;
   readonly staged: boolean;
   readonly changelistId: string;
+  /** Present only for files whose hunks are split across multiple changelists. */
+  readonly split?: {
+    /** Hunk ids owned by this changelist. */
+    readonly hunkIds: readonly string[];
+    readonly ownedHunks: number;
+    readonly totalHunks: number;
+  };
 }
 
 /** Result of reconciling persisted assignments against live git status. Returned by
@@ -89,5 +111,10 @@ export function createEmptyState(defaultListName: string): ChangelistState {
     isDefault: true,
     isActive: true,
   };
-  return { changelists: [defaultList], assignments: [] };
+  return { changelists: [defaultList], assignments: [], hunkAssignments: [] };
 }
+
+/** Maps each file that currently has a diff to the ids of the hunks it contains, in
+ *  file order. Built by gitService.buildHunkIndex() from live `git diff` output and
+ *  handed to the manager, which stays free of git and vscode imports. */
+export type HunkIndex = ReadonlyMap<RepoRelativePath, readonly string[]>;
