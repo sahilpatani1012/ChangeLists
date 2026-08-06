@@ -1,0 +1,289 @@
+{
+  "name": "changelists",
+  "displayName": "Changelists",
+  "description": "JetBrains/WebStorm-style named changelists for grouping and committing related file changes independently in VS Code.",
+  "version": "0.3.0",
+  "publisher": "changelists-dev",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "changelists",
+          "title": "Changelists",
+          "icon": "$(list-tree)"
+        }
+      ]
+    },
+    "views": {
+      "changelists": [
+        {
+          "id": "changelists.view",
+          "name": "Changelists",
+          "icon": "$(list-tree)",
+          "contextualTitle": "Changelists"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "changelists.view",
+        "contents": "No git repository detected in this workspace.\n[Open Folder](command:vscode.openFolder)",
+        "when": "changelists.noRepo"
+      }
+    ],
+    "commands": [
+      {
+        "command": "changelists.createChangelist",
+        "title": "New Changelist…",
+        "category": "Changelists",
+        "icon": "$(add)"
+      },
+      {
+        "command": "changelists.renameChangelist",
+        "title": "Rename…",
+        "category": "Changelists",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "changelists.deleteChangelist",
+        "title": "Delete Changelist",
+        "category": "Changelists",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "changelists.setActiveChangelist",
+        "title": "Set as Active",
+        "category": "Changelists"
+      },
+      {
+        "command": "changelists.switchActiveChangelist",
+        "title": "Switch Active Changelist…",
+        "category": "Changelists"
+      },
+      {
+        "command": "changelists.commitChangelist",
+        "title": "Commit Changelist…",
+        "category": "Changelists",
+        "icon": "$(check)"
+      },
+      {
+        "command": "changelists.shelveChangelist",
+        "title": "Shelve Changelist",
+        "category": "Changelists",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "changelists.unshelveChangelist",
+        "title": "Unshelve Changelist",
+        "category": "Changelists",
+        "icon": "$(export)"
+      },
+      {
+        "command": "changelists.moveSelectionToChangelist",
+        "title": "Move to Changelist…",
+        "category": "Changelists"
+      },
+      {
+        "command": "changelists.openFile",
+        "title": "Open File",
+        "category": "Changelists",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "changelists.openDiff",
+        "title": "Open Diff",
+        "category": "Changelists",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "changelists.discardChanges",
+        "title": "Discard Changes",
+        "category": "Changelists",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "changelists.refresh",
+        "title": "Refresh",
+        "category": "Changelists",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "changelists.collapseAll",
+        "title": "Collapse All",
+        "category": "Changelists",
+        "icon": "$(collapse-all)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "changelists.createChangelist",
+          "when": "view == changelists.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "changelists.refresh",
+          "when": "view == changelists.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "changelists.collapseAll",
+          "when": "view == changelists.view",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "changelists.commitChangelist",
+          "when": "view == changelists.view && viewItem =~ /^changelist(Default)?$/",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "changelists.setActiveChangelist",
+          "when": "view == changelists.view && viewItem =~ /^changelist(Default)?$/",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "changelists.renameChangelist",
+          "when": "view == changelists.view && viewItem =~ /^changelist(Default)?$/",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "changelists.createChangelist",
+          "when": "view == changelists.view && viewItem =~ /^changelist(Default)?$/",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "changelists.shelveChangelist",
+          "when": "view == changelists.view && viewItem == changelist",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "changelists.unshelveChangelist",
+          "when": "view == changelists.view && viewItem == changelistShelved",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "changelists.unshelveChangelist",
+          "when": "view == changelists.view && viewItem == changelistShelved",
+          "group": "inline@1"
+        },
+        {
+          "command": "changelists.deleteChangelist",
+          "when": "view == changelists.view && viewItem == changelist",
+          "group": "3_destructive@1"
+        },
+        {
+          "command": "changelists.openFile",
+          "when": "view == changelists.view && viewItem == changelistFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "changelists.discardChanges",
+          "when": "view == changelists.view && viewItem == changelistFile",
+          "group": "inline@2"
+        },
+        {
+          "command": "changelists.openFile",
+          "when": "view == changelists.view && viewItem == changelistFile",
+          "group": "1_open@1"
+        },
+        {
+          "command": "changelists.openDiff",
+          "when": "view == changelists.view && viewItem == changelistFile",
+          "group": "1_open@2"
+        },
+        {
+          "command": "changelists.moveSelectionToChangelist",
+          "when": "view == changelists.view && viewItem == changelistFile",
+          "group": "2_move@1"
+        },
+        {
+          "command": "changelists.discardChanges",
+          "when": "view == changelists.view && viewItem == changelistFile",
+          "group": "3_destructive@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "changelists.moveSelectionToChangelist",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Changelists",
+      "properties": {
+        "changelists.defaultListName": {
+          "type": "string",
+          "default": "Default",
+          "description": "Name of the changelist that always exists and cannot be deleted."
+        },
+        "changelists.persistTo": {
+          "type": "string",
+          "enum": [
+            "workspaceState",
+            "file"
+          ],
+          "enumDescriptions": [
+            "Store changelist assignments per-machine in VS Code's workspace storage.",
+            "Store changelist assignments in .vscode/changelists.json, shareable via version control."
+          ],
+          "default": "workspaceState",
+          "description": "Where changelist names and file assignments are persisted."
+        },
+        "changelists.autoAssignNewFilesToActive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically assign newly modified/untracked files to the active changelist."
+        },
+        "changelists.confirmOnDeleteNonEmpty": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask for confirmation before deleting a changelist that still contains files."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --production",
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "compile": "tsc --noEmit -p ./",
+    "compile:emit": "tsc -p ./",
+    "lint": "eslint src --ext ts",
+    "pretest": "npm run compile && npm run lint",
+    "test": "npm run test:unit",
+    "test:unit": "npm run compile:emit && node --test \"out/test/unit/**/*.test.js\"",
+    "test:integration": "npm run compile:emit && npm run build && node ./out/test/runTest.js",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/test-electron": "^2.3.9",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.20.0",
+    "eslint": "^8.56.0",
+    "glob": "^10.3.10",
+    "mocha": "^10.3.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "simple-git": "^3.22.0"
+  }
+}
