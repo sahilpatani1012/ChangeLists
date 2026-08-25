@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChangelistManager } from '../../changelistManager';
-import { createEmptyState, GitFileChange, ShelfInfo, ShelvedFile } from '../../types';
+import { Changelist, createEmptyState, GitFileChange, ShelfInfo, ShelvedFile } from '../../types';
 
 function change(filePath: string, kind: GitFileChange['kind'], extra: Partial<GitFileChange> = {}): GitFileChange {
   return { filePath, kind, staged: false, ...extra };
@@ -420,4 +420,50 @@ test('onDidChangeState fires on mutation and stops firing after dispose', () => 
   sub.dispose();
   manager.createChangelist('Another');
   assert.equal(calls, 1);
+});
+
+// ---- the shelved-active invariant (pass 3) -------------------------------------------
+
+test('a shelved changelist cannot be made active', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.shelveChangelist(feature.id, shelfFor([['src/a.ts', 'modified']]));
+
+  assert.throws(() => manager.setActiveChangelist(feature.id), /shelved/i);
+  assert.equal(manager.getActiveChangelist().id, manager.getDefaultChangelist().id);
+});
+
+test('reconcile never auto-assigns into a shelved changelist', () => {
+  // The failure this guards is invisible rather than loud: a shelved list renders its
+  // snapshot instead of live git status, so a file assigned into one vanishes from the
+  // tree entirely until the list is unshelved.
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFile('src/a.ts', feature.id);
+  manager.setActiveChangelist(feature.id);
+  manager.shelveChangelist(feature.id, shelfFor([['src/a.ts', 'modified']]));
+
+  manager.reconcile([change('src/new.ts', 'modified')], { autoAssignToActive: true });
+
+  assert.equal(manager.getChangelistIdForFile('src/new.ts'), manager.getDefaultChangelist().id);
+});
+
+test('getActiveChangelist ignores a shelved list that is somehow flagged active', () => {
+  // Third line of defence, for state that reached us from a hand-edited file rather than
+  // through setActiveChangelist().
+  const feature: Changelist = {
+    id: 'f',
+    name: 'Feature',
+    isDefault: false,
+    isActive: true,
+    shelf: { shelvedAt: '2026-01-01T00:00:00.000Z', files: [] },
+  };
+  const state = createEmptyState('Default');
+  const manager = new ChangelistManager({
+    ...state,
+    changelists: [...state.changelists.map((c) => ({ ...c, isActive: false })), feature],
+  });
+
+  assert.equal(manager.getActiveChangelist().id, manager.getDefaultChangelist().id);
 });

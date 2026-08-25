@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { errorMessage, resolveChangelistTarget } from './shared';
+import { errorMessage, isDeletable, resolveChangelistTarget } from './shared';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 
 /** "Delete Changelist" — Default is rejected outright (menu already hides this command
@@ -11,7 +11,14 @@ export async function deleteChangelistCommand(
   provider: ChangelistsTreeDataProvider,
   node?: ChangelistTreeNode
 ): Promise<void> {
-  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to delete');
+  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to delete', {
+    filter: isDeletable,
+    reject: (c) =>
+      c.isDefault
+        ? 'The Default changelist cannot be deleted.'
+        : `"${c.name}" is shelved — unshelve it before deleting, so its shelved work isn't orphaned.`,
+    empty: 'Changelists: there is no changelist that can be deleted.',
+  });
   if (!target) {
     return;
   }

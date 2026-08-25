@@ -209,6 +209,11 @@
           "group": "3_destructive@1"
         },
         {
+          "command": "changelists.unshelveChangelist",
+          "when": "view == changelists.view && viewItem == shelvedFile",
+          "group": "1_actions@1"
+        },
+        {
           "command": "changelists.openFile",
           "when": "view == changelists.view && viewItem =~ /^changelistFile/",
           "group": "inline@1"

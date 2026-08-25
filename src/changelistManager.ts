@@ -58,8 +58,15 @@ export class ChangelistManager {
     return found;
   }
 
+  /** The list reconcile() drops newly modified files into.
+   *
+   *  A shelved list is skipped even if it is somehow flagged active — setActiveChangelist()
+   *  refuses to make one active and normalize() clears the flag on load, so this is the
+   *  third line of defence rather than the first. It matters because the failure is
+   *  invisible: a shelved list renders its snapshot instead of live git status, so files
+   *  auto-assigned into one simply disappear from the tree until it is unshelved. */
   getActiveChangelist(): Changelist {
-    return this._state.changelists.find((c) => c.isActive) ?? this.getDefaultChangelist();
+    return this._state.changelists.find((c) => c.isActive && !c.shelf) ?? this.getDefaultChangelist();
   }
 
   /** Case-insensitive uniqueness check used both internally and by command-side
@@ -163,8 +170,15 @@ export class ChangelistManager {
   }
 
   setActiveChangelist(id: string): void {
-    if (!this.getChangelist(id)) {
+    const target = this.getChangelist(id);
+    if (!target) {
       throw new Error('Changelist not found.');
+    }
+    if (target.shelf) {
+      // Without this the shelve/unshelve guardrails are decorative: newly modified files
+      // auto-assign into the active list, so activating a shelved one strands them inside
+      // a changelist whose contents aren't in the working tree at all.
+      throw new Error(`"${target.name}" is shelved; unshelve it before making it active.`);
     }
     this._state = {
       ...this._state,

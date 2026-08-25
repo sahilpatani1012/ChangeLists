@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { isChangelistState, normalize, serialize } from './stateFile';
 import { ChangelistState, createEmptyState } from './types';
 
 const STATE_KEY = 'changelists.state.v1';
@@ -126,77 +127,6 @@ class FileStore implements PersistenceStore {
       watcher.onDidDelete(handle)
     );
   }
-}
-
-/** Serializes with sorted keys and one entry per line.
- *
- *  The ordering is the entire point: assignments are a set, but JSON.stringify preserves
- *  insertion order, so two teammates whose files differ only in *when* they touched a
- *  path would produce diffs — and merge conflicts — over semantically identical content.
- *  Sorting makes the file a deterministic function of its content, so git only ever sees
- *  a conflict where the two sides genuinely disagree. */
-function serialize(state: ChangelistState): string {
-  const ordered: ChangelistState = {
-    changelists: [...state.changelists].sort(compareById),
-    assignments: [...state.assignments].sort(
-      (a, b) => a.filePath.localeCompare(b.filePath) || a.changelistId.localeCompare(b.changelistId)
-    ),
-    hunkAssignments: [...(state.hunkAssignments ?? [])].sort(
-      (a, b) => a.filePath.localeCompare(b.filePath) || a.hunkId.localeCompare(b.hunkId)
-    ),
-  };
-  return JSON.stringify(ordered, null, 2) + '\n';
-}
-
-function compareById(a: { id: string; isDefault: boolean }, b: { id: string; isDefault: boolean }): number {
-  // Default first, so the file reads naturally; everything else by stable id.
-  if (a.isDefault !== b.isDefault) {
-    return a.isDefault ? -1 : 1;
-  }
-  return a.id.localeCompare(b.id);
-}
-
-/** Repairs states persisted by older versions or hand-edited files, so the rest of the
- *  codebase can rely on ChangelistManager's invariants (exactly one default, at most one
- *  active, no assignments pointing at changelists that don't exist). */
-function normalize(state: ChangelistState): ChangelistState {
-  const changelists = [...state.changelists];
-  if (changelists.length === 0) {
-    return createEmptyState('Default');
-  }
-  if (!changelists.some((c) => c.isDefault)) {
-    changelists[0] = { ...changelists[0], isDefault: true };
-  }
-  if (!changelists.some((c) => c.isActive && !c.shelf)) {
-    const fallback = changelists.findIndex((c) => c.isDefault);
-    changelists[fallback] = { ...changelists[fallback], isActive: true };
-  }
-  let seenActive = false;
-  const deduped = changelists.map((c) => {
-    if (!c.isActive) {
-      return c;
-    }
-    if (seenActive) {
-      return { ...c, isActive: false };
-    }
-    seenActive = true;
-    return c;
-  });
-
-  const ids = new Set(deduped.map((c) => c.id));
-  return {
-    changelists: deduped,
-    assignments: (state.assignments ?? []).filter((a) => ids.has(a.changelistId)),
-    hunkAssignments: (state.hunkAssignments ?? []).filter((h) => ids.has(h.changelistId)),
-  };
-}
-
-function isChangelistState(value: unknown): value is ChangelistState {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
-  const v = value as Record<string, unknown>;
-  return Array.isArray(v.changelists) && Array.isArray(v.assignments);
 }
 
 export function createPersistenceStore(

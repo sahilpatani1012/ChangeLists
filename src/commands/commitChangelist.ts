@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { errorMessage, resolveChangelistTarget } from './shared';
+import { errorMessage, isActionable, resolveChangelistTarget } from './shared';
 import { buildSubsetPatch, parseUnifiedDiff } from '../hunks';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 
@@ -19,7 +19,11 @@ export async function commitChangelistCommand(
   provider: ChangelistsTreeDataProvider,
   node?: ChangelistTreeNode
 ): Promise<void> {
-  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to commit');
+  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to commit', {
+    filter: isActionable,
+    reject: (c) => `"${c.name}" is shelved — unshelve it before committing.`,
+    empty: 'Changelists: every changelist is shelved. Unshelve one to commit it.',
+  });
   if (!target) {
     return;
   }
@@ -102,7 +106,9 @@ export async function commitChangelistCommand(
         const scopedFiles = await Promise.all(
           entries.map(async (e) => {
             if (!e.split || e.split.ownedHunks === e.split.totalHunks) {
-              return { filePath: e.filePath };
+              // renamedFrom rides along so this path stages the old path's removal too —
+              // the pathspec path gets that for free via `paths`, this one doesn't.
+              return { filePath: e.filePath, renamedFrom: e.renamedFrom };
             }
             const parsed = parseUnifiedDiff(await context.repo.getFileDiff(e.filePath));
             const patch = parsed ? buildSubsetPatch(parsed, new Set(e.split.hunkIds)) : undefined;

@@ -167,6 +167,35 @@ export function summarizeHunkCounts(hunk: Hunk): string {
   return `+${hunk.additions} −${hunk.deletions}`;
 }
 
+/** Reports why a captured diff could not be handed back to `git apply`, or undefined if
+ *  it looks applicable.
+ *
+ *  This exists for shelving, where the captured patch is the *only* copy of the user's
+ *  work: gitService reverts the working tree immediately after capturing, so a patch that
+ *  silently isn't a patch means the change is gone with nothing to restore. Both failure
+ *  modes below are produced by ordinary user git config rather than by anything exotic —
+ *  see the pinned config in gitService.ts — so the check is cheap insurance against a
+ *  class of bug whose blast radius is "your afternoon's work".
+ *
+ *  An empty diff is *not* a defect: it just means the file matched HEAD after all, and
+ *  unshelvePaths() already skips those. */
+export function describePatchDefect(patch: string): string | undefined {
+  if (patch.trim().length === 0) {
+    return undefined;
+  }
+  if (!patch.startsWith('diff --git ')) {
+    // `color.ui = always` prefixes an ANSI escape; a `diff.external` driver replaces the
+    // output wholesale. Either way this is not something `git apply` can read.
+    return 'git did not emit a plain unified diff';
+  }
+  if (/^Binary files .* differ$/m.test(patch) && !patch.includes('GIT binary patch')) {
+    // The `--binary` flag turns this stub into a literal/delta block. Without it git
+    // reports that the file changed but not *how*, which is unrecoverable.
+    return 'git summarised a binary file instead of encoding its contents';
+  }
+  return undefined;
+}
+
 /** A file whose hunks are split across more than one changelist. */
 export interface SplitFileSummary {
   readonly filePath: RepoRelativePath;

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { errorMessage, resolveChangelistTarget } from './shared';
+import { errorMessage, isShelvable, isShelved, resolveChangelistTarget } from './shared';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 import { ShelfInfo } from '../types';
 
@@ -18,7 +18,14 @@ export async function shelveChangelistCommand(
   provider: ChangelistsTreeDataProvider,
   node?: ChangelistTreeNode
 ): Promise<void> {
-  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to shelve');
+  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to shelve', {
+    filter: isShelvable,
+    reject: (c) =>
+      c.isDefault
+        ? 'The Default changelist cannot be shelved — it is where newly modified files land.'
+        : `"${c.name}" is already shelved.`,
+    empty: 'Changelists: there is no changelist that can be shelved.',
+  });
   if (!target) {
     return;
   }
@@ -86,7 +93,11 @@ export async function unshelveChangelistCommand(
   provider: ChangelistsTreeDataProvider,
   node?: ChangelistTreeNode
 ): Promise<void> {
-  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to unshelve');
+  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to unshelve', {
+    filter: isShelved,
+    reject: (c) => `"${c.name}" is not shelved.`,
+    empty: 'Changelists: nothing is shelved.',
+  });
   if (!target) {
     return;
   }

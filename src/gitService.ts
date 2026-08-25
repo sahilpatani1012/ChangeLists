@@ -6,15 +6,34 @@ import * as vscode from 'vscode';
 import simpleGit, { SimpleGit } from 'simple-git';
 import type { API as GitAPI, GitExtension, Repository as VscodeGitRepo, Change } from './api/git';
 import { Status } from './api/gitStatus';
-import { parseUnifiedDiff } from './hunks';
+import { describePatchDefect, parseUnifiedDiff } from './hunks';
 import { ChangeKind, GitFileChange, RepoRelativePath, ShelvedFile } from './types';
 
 /** One file's contribution to a scoped commit. `partialPatch` is set only when the
  *  changelist owns a subset of the file's hunks; otherwise the whole file is staged. */
 export interface ScopedCommitFile {
   readonly filePath: RepoRelativePath;
+  /** The pre-rename path, when this file is a rename. Staged alongside `filePath` so the
+   *  commit records the old path's removal instead of leaving a duplicate behind. */
+  readonly renamedFrom?: RepoRelativePath;
   readonly partialPatch?: string;
 }
+
+/** Config forced onto every git invocation this extension makes, via `-c`.
+ *
+ *  `diff.noprefix` and `diff.mnemonicPrefix` are the load-bearing pair. Both change the
+ *  `a/`…`b/` prefixes in a diff header, and `git apply` defaults to `-p1` — so a user who
+ *  sets either one turns every patch we generate into one git itself refuses to read
+ *  ("git diff header lacks filename information when removing 1 leading pathname
+ *  component"). That breaks unshelve and hunk-scoped commits: the two paths where a
+ *  generated patch is the only copy of the user's work.
+ *
+ *  `color.ui` is belt-and-braces alongside the explicit `--no-color` below: `color.ui =
+ *  always` puts ANSI escapes into piped output, which no amount of parsing recovers from.
+ *
+ *  Pinned here rather than at each call site so there is exactly one place to audit, and
+ *  so a diff and the `apply` that reverses it can never disagree about prefixes. */
+const PINNED_GIT_CONFIG = ['diff.noprefix=false', 'diff.mnemonicPrefix=false', 'color.ui=false'];
 
 /** Reads live status via the built-in vscode.git extension's API (source of truth for
  *  "what's modified" — PRD §7.3), and performs staging/commit via the git CLI (simple-git)
@@ -25,7 +44,7 @@ export class GitRepository {
   private readonly git: SimpleGit;
 
   constructor(private readonly repo: VscodeGitRepo) {
-    this.git = simpleGit({ baseDir: repo.rootUri.fsPath });
+    this.git = simpleGit({ baseDir: repo.rootUri.fsPath, config: PINNED_GIT_CONFIG });
   }
 
   get rootUri(): vscode.Uri {
@@ -60,9 +79,27 @@ export class GitRepository {
       stagedPaths.add(this.toRepoRelative(change.uri));
     }
 
+    // A rename is recorded in the index; editing the file afterwards adds a plain
+    // modification of the *new* path to the working tree, which the overlay below would
+    // otherwise let win — dropping the rename linkage entirely. That linkage is what
+    // reconcile() uses to carry the changelist across, what commitScoped() uses to stage
+    // the old path's removal, and what discardChanges() needs to restore it, so remember
+    // it here and re-attach it when the working-tree pass overwrites the index entry.
+    const renamedFromByPath = new Map<RepoRelativePath, RepoRelativePath>();
+    for (const change of state.indexChanges) {
+      if (statusToChangeKind(change.status) !== 'renamed' || !change.originalUri) {
+        continue;
+      }
+      const to = this.toRepoRelative(change.uri);
+      const from = this.toRepoRelative(change.originalUri);
+      if (from !== to) {
+        renamedFromByPath.set(to, from);
+      }
+    }
+
     const byPath = new Map<string, GitFileChange>();
     const record = (change: Change, filePath: string, staged: boolean): void => {
-      const entry = this.toGitFileChange(change, filePath, staged);
+      const entry = this.toGitFileChange(change, filePath, staged, renamedFromByPath.get(filePath));
       if (entry) {
         byPath.set(filePath, entry);
       } else {
@@ -95,14 +132,26 @@ export class GitRepository {
     return [...byPath.values()];
   }
 
-  private toGitFileChange(change: Change, filePath: RepoRelativePath, staged: boolean): GitFileChange | undefined {
-    const kind = statusToChangeKind(change.status);
-    if (!kind) {
+  private toGitFileChange(
+    change: Change,
+    filePath: RepoRelativePath,
+    staged: boolean,
+    indexRenamedFrom?: RepoRelativePath
+  ): GitFileChange | undefined {
+    const rawKind = statusToChangeKind(change.status);
+    if (!rawKind) {
       return undefined;
     }
-    const renamedFrom =
-      kind === 'renamed' && change.originalUri ? this.toRepoRelative(change.originalUri) : undefined;
-    return { filePath, kind, renamedFrom, staged };
+    // Only a working-tree *modification* is re-labelled: that's the rename-then-edit case
+    // (git's own `RM` status), where the file really is still a rename and every consumer
+    // — status letter, commit pathspec, discard, shelve — wants to treat it as one.
+    // Any other working-tree status over a renamed path is left exactly as reported.
+    const kind = rawKind === 'modified' && indexRenamedFrom ? 'renamed' : rawKind;
+    if (kind !== 'renamed') {
+      return { filePath, kind, staged };
+    }
+    const from = (change.originalUri ? this.toRepoRelative(change.originalUri) : undefined) ?? indexRenamedFrom;
+    return { filePath, kind, renamedFrom: from === filePath ? undefined : from, staged };
   }
 
   /** Paths currently staged in the index that are NOT in `excluding` — used to warn the
@@ -148,12 +197,28 @@ export class GitRepository {
     await this.git.raw(args);
   }
 
-  /** Unified diff of one file against HEAD. `-U3` and `--no-color` are explicit rather
-   *  than inherited so a user's `diff.context`/`color.ui` config can't change the shape
-   *  of what we parse into hunks. `--no-ext-diff` keeps a configured external difftool
-   *  from replacing the machine-readable output entirely. */
+  /** The single place a diff against HEAD is produced. `-U3` and `--no-color` are
+   *  explicit rather than inherited so a user's `diff.context`/`color.ui` config can't
+   *  change the shape of what we parse into hunks, and `--no-ext-diff` keeps a configured
+   *  external difftool from replacing the machine-readable output entirely; the prefix
+   *  settings that `git apply` depends on are pinned instance-wide (PINNED_GIT_CONFIG).
+   *
+   *  `binary: true` is for captures that have to be *restored* later — without it git
+   *  reports "Binary files a/x and b/x differ", which records that a file changed but not
+   *  how. Hunk parsing never needs it (a binary file has no hunks to split either way),
+   *  so it stays opt-in rather than costing every diff the encoded blob. */
+  private diffAgainstHead(filePath: RepoRelativePath, options: { binary?: boolean } = {}): Promise<string> {
+    const args = ['diff', '--no-color', '--no-ext-diff', '-U3'];
+    if (options.binary) {
+      args.push('--binary');
+    }
+    args.push('HEAD', '--', filePath);
+    return this.git.raw(args);
+  }
+
+  /** Unified diff of one file against HEAD, for hunk parsing. */
   async getFileDiff(filePath: RepoRelativePath): Promise<string> {
-    return this.git.diff(['--no-color', '--no-ext-diff', '-U3', 'HEAD', '--', filePath]);
+    return this.diffAgainstHead(filePath);
   }
 
   /** Builds the hunkId index the manager needs for split rendering/reconciliation.
@@ -209,6 +274,13 @@ export class GitRepository {
         } else {
           await this.git.raw(['add', '--', file.filePath]);
         }
+        if (file.renamedFrom) {
+          // `read-tree HEAD` put the old path back in the index, and nothing above stages
+          // its removal — a pathspec commit gets this for free, this path does not. Left
+          // out, the commit adds the new file and keeps the old one, so the "rename" lands
+          // as a copy. `--ignore-unmatch` keeps this harmless if HEAD never had the path.
+          await this.git.raw(['rm', '--cached', '--force', '--ignore-unmatch', '--', file.renamedFrom]);
+        }
       }
       const args = ['commit', '-m', message];
       if (options.amend) {
@@ -253,7 +325,17 @@ export class GitRepository {
     const captured: ShelvedFile[] = [];
     for (const entry of entries) {
       if (entry.kind === 'modified' || entry.kind === 'deleted') {
-        const patch = await this.git.diff(['HEAD', '--', entry.filePath]);
+        const patch = await this.diffAgainstHead(entry.filePath, { binary: true });
+        // Verified before anything is reverted, because the revert below is what makes
+        // this patch the only remaining copy of the change. Capturing an unappliable
+        // patch and reverting anyway is how "shelve" turns into "silently discard".
+        const defect = describePatchDefect(patch);
+        if (defect) {
+          throw new Error(
+            `Cannot shelve "${entry.filePath}": ${defect}, so unshelving could not restore it. ` +
+              'Nothing has been changed in your working tree.'
+          );
+        }
         captured.push({ filePath: entry.filePath, kind: entry.kind, storage: 'patch', patch });
       } else {
         // added / untracked / renamed: no HEAD blob to diff against (a rename's new
@@ -315,18 +397,44 @@ export class GitRepository {
     }
   }
 
-  /** Reverts `filePath` to HEAD (modified/deleted files) or removes it from disk
-   *  (untracked/added files). Implemented directly rather than via the git extension's
-   *  internal `git.clean` command, whose signature expects an SCM `Resource` object
-   *  minted by the git extension itself and isn't a supported cross-extension surface. */
+  /** Reverts `filePath` to HEAD (modified/deleted files) or removes it (untracked/added,
+   *  and the new-path side of a rename). Implemented directly rather than via the git
+   *  extension's internal `git.clean` command, whose signature expects an SCM `Resource`
+   *  object minted by the git extension itself and isn't a supported cross-extension
+   *  surface.
+   *
+   *  Branching is on "does HEAD have a blob at this path" rather than on `kind`, because
+   *  that is the only question `git checkout HEAD -- <path>` actually cares about — it
+   *  fails with "pathspec did not match any file(s) known to git" for anything HEAD has
+   *  never seen, which covers renames (the new path) and staged additions alike. */
   async discardChanges(entry: GitFileChange): Promise<void> {
-    if (entry.kind === 'untracked' || (entry.kind === 'added' && !entry.staged)) {
-      await vscode.workspace.fs.delete(this.toAbsoluteUri(entry.filePath), { useTrash: true });
+    if (entry.renamedFrom) {
+      // Undo a rename the way git models one: drop the new path, restore the original.
+      // Doing it in the other order would leave both paths present.
+      await this.removeUntracked(entry.filePath);
+      await this.git.raw(['checkout', 'HEAD', '--', entry.renamedFrom]);
+      return;
+    }
+    if (entry.kind === 'untracked' || entry.kind === 'added') {
+      await this.removeUntracked(entry.filePath);
       return;
     }
     await this.git.raw(['checkout', 'HEAD', '--', entry.filePath]);
-    if (entry.renamedFrom) {
-      await this.git.raw(['checkout', 'HEAD', '--', entry.renamedFrom]);
+  }
+
+  /** Removes a path HEAD has no blob for: clears any index entry (a staged addition or
+   *  the new half of a rename has one; a plain untracked file doesn't, hence
+   *  `--ignore-unmatch`), then sends the file to the OS trash so it stays recoverable —
+   *  the confirmation only promises it can't be undone *from within Changelists*. */
+  private async removeUntracked(filePath: RepoRelativePath): Promise<void> {
+    await this.git.raw(['rm', '--cached', '--force', '--ignore-unmatch', '--', filePath]);
+    try {
+      await vscode.workspace.fs.delete(this.toAbsoluteUri(filePath), { useTrash: true });
+    } catch (err) {
+      // Already gone from disk — the index entry was the only thing left to clean up.
+      if (!(err instanceof vscode.FileSystemError && err.code === 'FileNotFound')) {
+        throw err;
+      }
     }
   }
 

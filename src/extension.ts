@@ -5,6 +5,9 @@ import { createPersistenceStore } from './persistence';
 import { ChangelistsStatusBarItem } from './statusBar';
 import { ChangelistsTreeDataProvider } from './treeDataProvider';
 
+/** Held only so deactivate() can flush debounced persistence; nothing else reads it. */
+let activeProvider: ChangelistsTreeDataProvider | undefined;
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const persistMode = vscode.workspace.getConfiguration('changelists').get<'workspaceState' | 'file'>(
     'persistTo',
@@ -40,17 +43,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('changelists.persistTo') || e.affectsConfiguration('changelists.defaultListName')) {
-        void provider.initialize().then(() => statusBarItem.refresh());
+        void provider
+          .initialize()
+          .then(() => statusBarItem.refresh())
+          .catch((err) =>
+            vscode.window.showErrorMessage(
+              `Changelists: could not reload after a settings change — ${
+                err instanceof Error ? err.message : String(err)
+              }`
+            )
+          );
       }
     })
   );
 
+  activeProvider = provider;
   await provider.initialize();
   statusBarItem.refresh();
 }
 
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
   // All disposables were registered on context.subscriptions during activate(); VS Code
-  // disposes them automatically on deactivation. Nothing else holds process-level state
-  // (no timers, no open file handles) that needs explicit teardown here.
+  // disposes them automatically on deactivation. The one thing disposal can't cover is
+  // persistence: it is debounced (see repositoryContext.ts), so a changelist created in
+  // the last few hundred milliseconds may still be sitting in a timer. VS Code awaits
+  // this function, which makes it the only chance to get that write to disk.
+  const provider = activeProvider;
+  activeProvider = undefined;
+  await provider?.flushPendingWrites();
 }

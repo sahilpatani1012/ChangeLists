@@ -3,6 +3,7 @@ import { ChangelistManager } from './changelistManager';
 import { discoverRepositories, watchRepositoryDiscovery } from './gitService';
 import { ChangelistsConflictError, PersistenceStore } from './persistence';
 import { RepositoryContext } from './repositoryContext';
+import { CoalescingRunner } from './scheduling';
 import { Changelist, ChangelistFileEntry, ChangeKind, createEmptyState } from './types';
 
 export interface RepoNode {
@@ -30,6 +31,10 @@ export interface EmptyStateNode {
 
 export type ChangelistTreeNode = RepoNode | ChangelistNode | FileNode | EmptyStateNode;
 
+/** What to do with state still sitting in the persistence debounce when a discovery pass
+ *  tears the current contexts down. See ChangelistsTreeDataProvider.initialize(). */
+type PendingWrites = 'flush' | 'discard';
+
 const STATUS_LETTER: Record<ChangeKind, string> = {
   modified: 'M',
   added: 'A',
@@ -46,8 +51,24 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   private contexts: RepositoryContext[] = [];
-  private readonly disposables: vscode.Disposable[] = [];
+  /** Everything created by the *current* discovery pass: the RepositoryContexts, their
+   *  git state subscriptions, and their store watchers. Disposed wholesale at the top of
+   *  the next pass.
+   *
+   *  Scoping matters more than it looks: these used to accumulate forever. A stale git
+   *  subscription keeps driving a context that was already disposed, and — because a
+   *  store watcher's handler re-enters discovery — every external change to
+   *  `.vscode/changelists.json` left behind one more watcher than it found, so the count
+   *  doubled per reload until the window became unusable. */
+  private perPass: vscode.Disposable[] = [];
   private discoveryWatcher: vscode.Disposable | undefined;
+  /** Serializes discovery. Concurrent callers join the running pass rather than starting
+   *  a second one — two interleaved passes each reset `contexts` and then each append to
+   *  it, leaving one repository rendered (and persisting) twice. The runner's re-run
+   *  guarantees the last caller still gets a pass that began after it asked. */
+  private readonly discoveryRunner = new CoalescingRunner(() => this.runDiscoveryPass());
+  /** Latched by callers, consumed by the next pass. See initialize(). */
+  private nextPendingWrites: PendingWrites = 'flush';
 
   /** Stable ChangelistNode instances, keyed `${repoRoot}::${changelistId}`.
    *
@@ -64,11 +85,35 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
 
   constructor(private readonly store: PersistenceStore) {}
 
-  async initialize(): Promise<void> {
-    await this.rediscoverRepositories();
+  /** Discovers repositories and (re)builds a context for each. Safe to call concurrently
+   *  and re-entrantly: a call arriving mid-pass joins the running one and asks it to go
+   *  round again, so the last request always gets a pass that started after it.
+   *
+   *  `pendingWrites` decides what happens to state still sitting in the persistence
+   *  debounce when the outgoing contexts are torn down — see RepositoryContext. Default
+   *  'flush' keeps the user's recent work; the store watcher passes 'discard', because
+   *  there the file on disk is the newer side. */
+  async initialize(options: { pendingWrites?: PendingWrites } = {}): Promise<void> {
+    // 'discard' latches: it means the file changed underneath us, which makes anything
+    // queued in memory the stale side regardless of what any other caller asked for. The
+    // flag survives until a pass consumes it, so a request arriving mid-pass still
+    // governs the re-run that request triggers.
+    if ((options.pendingWrites ?? 'flush') === 'discard') {
+      this.nextPendingWrites = 'discard';
+    }
+    await this.discoveryRunner.trigger();
+  }
+
+  private async runDiscoveryPass(): Promise<void> {
+    const pendingWrites = this.nextPendingWrites;
+    this.nextPendingWrites = 'flush';
+    await this.rediscoverRepositories(pendingWrites);
+    // Re-armed each pass rather than once: the git extension may not have been active the
+    // first time round, in which case watchRepositoryDiscovery() returned a no-op.
     this.discoveryWatcher?.dispose();
-    this.discoveryWatcher = watchRepositoryDiscovery(() => void this.rediscoverRepositories());
-    this.disposables.push(this.discoveryWatcher);
+    this.discoveryWatcher = watchRepositoryDiscovery(() => {
+      void this.initialize().catch(reportInitializeFailure);
+    });
   }
 
   private config() {
@@ -79,13 +124,22 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     };
   }
 
-  private async rediscoverRepositories(): Promise<void> {
+  private async rediscoverRepositories(pendingWrites: PendingWrites): Promise<void> {
     const repos = await discoverRepositories();
     void vscode.commands.executeCommand('setContext', 'changelists.noRepo', repos.length === 0);
 
-    for (const ctx of this.contexts) {
-      ctx.dispose();
+    // Settle the outgoing contexts before the loads below read the store again, so a
+    // debounced write can't land on top of state we've already re-read.
+    if (pendingWrites === 'flush') {
+      await Promise.all(this.contexts.map((ctx) => ctx.flushPendingWrites()));
+    } else {
+      for (const ctx of this.contexts) {
+        ctx.discardPendingWrites();
+      }
     }
+    // Contexts, their git subscriptions and their store watchers all die here together.
+    vscode.Disposable.from(...this.perPass).dispose();
+    this.perPass = [];
     this.nodeCache.clear();
     this.signatures.clear();
 
@@ -111,19 +165,22 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       // invariant the first time getDefaultChangelist() is called.
       const manager = new ChangelistManager(state.changelists.length ? state : createEmptyState(defaultListName));
       const context = new RepositoryContext(repo, manager, this.store, () => this.refreshChanged());
-      this.disposables.push(
+      this.perPass.push(
         context,
-        repo.onDidChangeState(() => void context.refreshLiveChanges(this.config().autoAssignToActive))
+        // Debounced: this fires on every save, index touch and focus change, and a
+        // refresh is not free once any file in the repo is split.
+        repo.onDidChangeState(() => context.scheduleRefresh(this.config().autoAssignToActive))
       );
       const externalWatch = this.store.watch?.(repo.rootUri, () => {
         // A teammate's changelists.json arrived (pull/branch switch/hand edit). Reload
         // from scratch rather than merging in-memory state over it — the file is the
         // source of truth in file mode, and a silent three-way merge here is exactly the
-        // kind of guess that loses somebody's grouping.
-        void this.initialize();
+        // kind of guess that loses somebody's grouping. Same reasoning discards our own
+        // pending write instead of flushing it over what just arrived.
+        void this.initialize({ pendingWrites: 'discard' }).catch(reportInitializeFailure);
       });
       if (externalWatch) {
-        this.disposables.push(externalWatch);
+        this.perPass.push(externalWatch);
       }
       this.contexts.push(context);
       await context.refreshLiveChanges(autoAssignToActive);
@@ -351,6 +408,24 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     const fileName = segments[segments.length - 1] + (entry.kind === 'deleted' ? ' (deleted)' : '');
     const dir = segments.slice(0, -1).join('/');
     item.label = fileName;
+
+    if (node.changelist.shelf) {
+      // A shelved row describes a snapshot, not something in the working tree. Opening it
+      // would show whatever HEAD has (or nothing at all), and discard/move/split would act
+      // on content that isn't there. A contextValue outside the `changelistFile` family
+      // keeps every file menu off it, and leaving `command` unset makes clicking the row
+      // do nothing rather than something wrong.
+      item.contextValue = 'shelvedFile';
+      item.description = dir ? `${dir}  ${statusLetter(entry.kind)} · shelved` : `${statusLetter(entry.kind)} · shelved`;
+      item.id = `${context.repo.rootUri.toString()}::${node.changelist.id}::${entry.filePath}`;
+      item.resourceUri = uri;
+      item.tooltip = new vscode.MarkdownString(
+        `**${entry.filePath}**\n\n${entry.kind} · shelved\n\n` +
+          `Not in your working tree. Unshelve "${node.changelist.name}" to bring it back.`
+      );
+      return item;
+    }
+
     // Status letter goes in description text rather than as a colored FileDecoration
     // badge: a FileDecorationProvider applies globally (Explorer, editor tabs, quick
     // open), not just this view, and every file we'd decorate is by definition already
@@ -390,13 +465,26 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     return item;
   }
 
+  /** Awaited by deactivate(): the persistence debounce means a changelist created in the
+   *  last moments before shutdown can still be sitting in a timer. */
+  async flushPendingWrites(): Promise<void> {
+    await Promise.all(this.contexts.map((ctx) => ctx.flushPendingWrites()));
+  }
+
   dispose(): void {
-    for (const ctx of this.contexts) {
-      ctx.dispose();
-    }
-    vscode.Disposable.from(...this.disposables).dispose();
+    this.discoveryWatcher?.dispose();
+    this.discoveryWatcher = undefined;
+    vscode.Disposable.from(...this.perPass).dispose();
+    this.perPass = [];
+    this.contexts = [];
     this._onDidChangeTreeData.dispose();
   }
+}
+
+function reportInitializeFailure(err: unknown): void {
+  void vscode.window.showErrorMessage(
+    `Changelists: could not load changelists — ${err instanceof Error ? err.message : String(err)}`
+  );
 }
 
 export function statusLetter(kind: ChangeKind): string {

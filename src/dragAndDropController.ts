@@ -60,7 +60,15 @@ export class ChangelistsDragAndDropController implements vscode.TreeDragAndDropC
     if (!targetChangelistId) {
       return;
     }
-    target.context.manager.assignFiles(payload.filePaths, targetChangelistId);
+    try {
+      target.context.manager.assignFiles(payload.filePaths, targetChangelistId);
+    } catch (err) {
+      // assignFiles() refuses a shelved destination. Without this the rejection vanished
+      // into VS Code's drop handler: the files simply didn't move and nothing said why.
+      void vscode.window.showErrorMessage(
+        `Changelists: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 }
 

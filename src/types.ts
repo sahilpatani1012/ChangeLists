@@ -69,7 +69,9 @@ export interface ChangelistState {
 export interface GitFileChange {
   readonly filePath: RepoRelativePath;
   readonly kind: ChangeKind;
-  /** Present only when kind === 'renamed'; the path it was renamed from. */
+  /** Present only when kind === 'renamed'; the path it was renamed from. A file that was
+   *  renamed and then edited reports `renamed` here rather than `modified` — git's own
+   *  `RM` status — so this stays set through the edit. */
   readonly renamedFrom?: RepoRelativePath;
   readonly staged: boolean;
 }
