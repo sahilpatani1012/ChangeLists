@@ -28,7 +28,7 @@ export async function reviewChangelistCommand(
   }
   const { context, changelist } = target;
 
-  const entries = (context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex).get(changelist.id) ?? [])
+  const entries = (context.grouped.get(changelist.id) ?? [])
     .slice()
     .sort((a, b) => a.filePath.localeCompare(b.filePath));
 

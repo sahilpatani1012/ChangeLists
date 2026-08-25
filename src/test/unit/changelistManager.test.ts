@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChangelistManager } from '../../changelistManager';
-import { Changelist, createEmptyState, GitFileChange, ShelfInfo, ShelvedFile } from '../../types';
+import { Changelist, createEmptyState, GitFileChange, ShelfInfo, ShelvedFileMeta } from '../../types';
 
 function change(filePath: string, kind: GitFileChange['kind'], extra: Partial<GitFileChange> = {}): GitFileChange {
   return { filePath, kind, staged: false, ...extra };
@@ -177,13 +177,11 @@ test('getFilesGroupedByChangelist groups by changelist and skips stale assignmen
 // ---- shelve / unshelve (v2) ---------------------------------------------------------
 
 function shelfFor(files: Array<[string, GitFileChange['kind']]>): ShelfInfo {
+  // Metadata only: the payloads live in the shelf store, outside ChangelistState, so they
+  // never reach a shared .vscode/changelists.json.
   return {
     shelvedAt: new Date('2026-01-01T00:00:00Z').toISOString(),
-    files: files.map(([filePath, kind]): ShelvedFile =>
-      kind === 'modified' || kind === 'deleted'
-        ? { filePath, kind, storage: 'patch', patch: `--- fake patch for ${filePath} ---` }
-        : { filePath, kind, storage: 'content', content: Buffer.from(filePath).toString('base64') }
-    ),
+    files: files.map(([filePath, kind]): ShelvedFileMeta => ({ filePath, kind })),
   };
 }
 
@@ -466,4 +464,92 @@ test('getActiveChangelist ignores a shelved list that is somehow flagged active'
   });
 
   assert.equal(manager.getActiveChangelist().id, manager.getDefaultChangelist().id);
+});
+
+// ---- resumable unshelve (pass 5) -------------------------------------------------------
+
+test('a partial unshelve keeps only what did not land shelved', () => {
+  // git apply cannot apply the same patch twice, so a shelf that kept everything after a
+  // partial failure would make the suggested retry impossible.
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFiles(['ok.ts', 'conflicted.ts'], feature.id);
+  manager.shelveChangelist(feature.id, shelfFor([['ok.ts', 'modified'], ['conflicted.ts', 'modified']]));
+
+  const { remaining } = manager.applyUnshelved(feature.id, ['ok.ts']);
+
+  assert.equal(remaining, 1);
+  assert.equal(manager.isShelved(feature.id), true, 'still shelved, because something is still in it');
+  assert.deepEqual(manager.getChangelist(feature.id)?.shelf?.files.map((f) => f.filePath), ['conflicted.ts']);
+  assert.equal(manager.getChangelistIdForFile('ok.ts'), feature.id, 'what landed is back in the changelist');
+  assert.equal(manager.getChangelistIdForFile('conflicted.ts'), undefined);
+});
+
+test('finishing a partial unshelve clears the shelf', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFiles(['ok.ts', 'conflicted.ts'], feature.id);
+  manager.shelveChangelist(feature.id, shelfFor([['ok.ts', 'modified'], ['conflicted.ts', 'modified']]));
+  manager.applyUnshelved(feature.id, ['ok.ts']);
+
+  const { remaining } = manager.applyUnshelved(feature.id, ['conflicted.ts']);
+
+  assert.equal(remaining, 0);
+  assert.equal(manager.isShelved(feature.id), false);
+  assert.equal(manager.getChangelistIdForFile('conflicted.ts'), feature.id);
+});
+
+test('an unshelve that restored nothing leaves the shelf exactly as it was', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFile('a.ts', feature.id);
+  manager.shelveChangelist(feature.id, shelfFor([['a.ts', 'modified']]));
+
+  const { remaining } = manager.applyUnshelved(feature.id, []);
+
+  assert.equal(remaining, 1);
+  assert.equal(manager.isShelved(feature.id), true);
+  assert.equal(manager.getChangelistIdForFile('a.ts'), undefined);
+});
+
+// ---- case drift on case-insensitive filesystems (pass 6) -------------------------------
+
+test('reconcile re-keys an assignment whose file came back with different casing', () => {
+  // On Windows and macOS the same file can be reported under different casing than the
+  // assignment was stored with. Dropping it would silently move the user's file to
+  // Default, which reads as the extension losing their grouping for no reason.
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFile('src/Foo.ts', feature.id);
+
+  const result = manager.reconcile([change('src/foo.ts', 'modified')], { autoAssignToActive: true });
+
+  assert.equal(result.droppedAssignments.length, 0);
+  assert.equal(manager.getChangelistIdForFile('src/foo.ts'), feature.id);
+  assert.equal(manager.getChangelistIdForFile('src/Foo.ts'), undefined, 're-keyed, not duplicated');
+});
+
+test('a case-insensitive match never steals a path that already has its own assignment', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  const other = manager.createChangelist('Other');
+  manager.assignFile('src/Foo.ts', feature.id);
+  manager.assignFile('src/foo.ts', other.id);
+
+  // Only the lowercase one is still modified; it belongs to Other and must stay there.
+  manager.reconcile([change('src/foo.ts', 'modified')], { autoAssignToActive: true });
+
+  assert.equal(manager.getChangelistIdForFile('src/foo.ts'), other.id);
+});
+
+test('an exact match is preferred over a case-insensitive one', () => {
+  const manager = freshManager();
+  const feature = manager.createChangelist('Feature');
+  manager.assignFile('src/foo.ts', feature.id);
+
+  manager.reconcile([change('src/foo.ts', 'modified'), change('src/FOO.ts', 'modified')], {
+    autoAssignToActive: true,
+  });
+
+  assert.equal(manager.getChangelistIdForFile('src/foo.ts'), feature.id);
 });

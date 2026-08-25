@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { RepositoryContext } from '../repositoryContext';
-import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
-import { Changelist } from '../types';
+import { ChangelistsTreeDataProvider, ChangelistTreeNode, FileNode } from '../treeDataProvider';
+import { Changelist, MovableRow } from '../types';
 
 export function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -88,4 +88,31 @@ export async function resolveChangelistTarget(
   }
   const changelist = await pickChangelist(context, { ...options, title: pickerTitle });
   return changelist ? { context, changelist } : undefined;
+}
+
+export function autoAssignSetting(): boolean {
+  return vscode.workspace.getConfiguration('changelists').get<boolean>('autoAssignNewFilesToActive', true);
+}
+
+/** Re-reads git status after a mutation that changes what the hunk index has to cover.
+ *
+ *  Needed because building that index is skipped entirely when no file has hunk overrides
+ *  — the right optimisation, with one bootstrapping hole: the *first* split of a session
+ *  runs against an index built back when there was nothing to index, so the new split has
+ *  no hunk ids to render and the row shows as a whole file. Refreshing after the mutation
+ *  closes it. */
+export async function refreshAfterHunkChange(context: RepositoryContext): Promise<void> {
+  await context.refreshLiveChanges(autoAssignSetting());
+}
+
+/** The rows a file-scoped command should act on, in the form ChangelistManager.moveRows()
+ *  expects: a partially-owned row carries its hunks so moving it moves that share, while
+ *  a whole file (or a file whose row happens to own every hunk) moves as a unit. */
+export function toMovableRows(fileNodes: readonly FileNode[]): MovableRow[] {
+  return fileNodes.map((n) => ({
+    filePath: n.entry.filePath,
+    changelistId: n.changelist.id,
+    hunkIds: n.entry.split?.hunkIds,
+    totalHunks: n.entry.split?.totalHunks,
+  }));
 }

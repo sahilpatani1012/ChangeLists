@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { isChangelistState, normalize, serialize } from '../../stateFile';
-import { Changelist, ChangelistState, ShelfInfo } from '../../types';
+import { Changelist, ChangelistState, SCHEMA_VERSION, ShelfInfo } from '../../types';
 
 const shelf: ShelfInfo = { shelvedAt: '2026-01-01T00:00:00.000Z', files: [] };
 
@@ -139,4 +139,82 @@ test('isChangelistState rejects anything without the two required arrays', () =>
   assert.equal(isChangelistState(null), false);
   assert.equal(isChangelistState('nope'), false);
   assert.equal(isChangelistState([]), false);
+});
+
+// ---- schema version and hardened validation (pass 5) -----------------------------------
+
+test('normalize stamps the current schema version', () => {
+  const repaired = normalize(stateOf([list({ id: 'd', isDefault: true, isActive: true })]));
+  assert.equal(repaired.version, SCHEMA_VERSION);
+  assert.equal(JSON.parse(serialize(repaired)).version, SCHEMA_VERSION);
+});
+
+test('normalize upgrades pre-versioned state without discarding it', () => {
+  // What 0.x and 1.0 wrote: no version field at all.
+  const legacy = {
+    changelists: [list({ id: 'd', isDefault: true, isActive: true }), list({ id: 'f' })],
+    assignments: [{ filePath: 'src/a.ts', changelistId: 'f' }],
+  } as ChangelistState;
+
+  const repaired = normalize(legacy);
+
+  assert.equal(repaired.version, SCHEMA_VERSION);
+  assert.equal(repaired.changelists.length, 2);
+  assert.deepEqual(repaired.assignments, [{ filePath: 'src/a.ts', changelistId: 'f' }]);
+});
+
+test('normalize drops changelist entries missing the fields everything dereferences', () => {
+  // isChangelistState only checks that the arrays exist, so a hand-edited file can carry
+  // an entry with no id — which renders as a row keyed `undefined`.
+  const repaired = normalize(
+    stateOf([
+      list({ id: 'good', isDefault: true, isActive: true }),
+      { name: 'no id' } as unknown as Changelist,
+      { id: '', name: 'empty id' } as unknown as Changelist,
+      { id: 'no-name' } as unknown as Changelist,
+    ])
+  );
+  assert.deepEqual(repaired.changelists.map((c) => c.id), ['good']);
+});
+
+test('normalize keeps only the first changelist for a duplicated id', () => {
+  const repaired = normalize(
+    stateOf([
+      list({ id: 'dup', name: 'first', isDefault: true, isActive: true }),
+      list({ id: 'dup', name: 'second' }),
+    ])
+  );
+  assert.equal(repaired.changelists.length, 1);
+  assert.equal(repaired.changelists[0].name, 'first');
+});
+
+test('normalize keeps one assignment per file', () => {
+  // Two claims on one path would render the file under both lists at once and make every
+  // "which list owns this?" lookup depend on array order.
+  const repaired = normalize(
+    stateOf([list({ id: 'a', isDefault: true, isActive: true }), list({ id: 'b' })], {
+      assignments: [
+        { filePath: 'src/x.ts', changelistId: 'a' },
+        { filePath: 'src/x.ts', changelistId: 'b' },
+      ],
+    })
+  );
+  assert.deepEqual(repaired.assignments, [{ filePath: 'src/x.ts', changelistId: 'a' }]);
+});
+
+test('normalize drops hunk overrides for files that have no assignment left', () => {
+  const repaired = normalize(
+    stateOf([list({ id: 'a', isDefault: true, isActive: true })], {
+      assignments: [{ filePath: 'kept.ts', changelistId: 'a' }],
+      hunkAssignments: [
+        { filePath: 'kept.ts', hunkId: 'h1', changelistId: 'a' },
+        { filePath: 'kept.ts', hunkId: 'h1', changelistId: 'a' },
+        { filePath: 'unassigned.ts', hunkId: 'h2', changelistId: 'a' },
+      ],
+    })
+  );
+  assert.deepEqual(
+    repaired.hunkAssignments?.map((h) => `${h.filePath}:${h.hunkId}`),
+    ['kept.ts:h1']
+  );
 });

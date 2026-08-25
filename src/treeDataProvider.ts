@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import { ChangelistManager } from './changelistManager';
-import { discoverRepositories, watchRepositoryDiscovery } from './gitService';
-import { ChangelistsConflictError, PersistenceStore } from './persistence';
+import { discoverRepositories, GitRepository, watchRepositoryDiscovery } from './gitService';
+import { ChangelistsConflictError, createPersistenceStore, PersistenceStore } from './persistence';
 import { RepositoryContext } from './repositoryContext';
+import { migrateInlineShelves, ShelfStore } from './shelfStore';
+import { logError } from './log';
 import { CoalescingRunner } from './scheduling';
 import { Changelist, ChangelistFileEntry, ChangeKind, createEmptyState } from './types';
 
@@ -34,6 +36,8 @@ export type ChangelistTreeNode = RepoNode | ChangelistNode | FileNode | EmptySta
 /** What to do with state still sitting in the persistence debounce when a discovery pass
  *  tears the current contexts down. See ChangelistsTreeDataProvider.initialize(). */
 type PendingWrites = 'flush' | 'discard';
+
+type PersistMode = 'workspaceState' | 'file';
 
 const STATUS_LETTER: Record<ChangeKind, string> = {
   modified: 'M',
@@ -77,13 +81,76 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
    *  time would make every scoped fire a silent no-op and force us back to full
    *  re-renders. */
   private readonly nodeCache = new Map<string, ChangelistNode>();
+  /** Repo nodes are cached for the same reason changelist nodes are: reveal() and scoped
+   *  refresh both match by object identity. */
+  private readonly repoNodeCache = new Map<string, RepoNode>();
+  private treeView: vscode.TreeView<ChangelistTreeNode> | undefined;
 
   /** Last-rendered content signature per changelist, for diffing (PRD §9: "diff against
    *  previous state and patch the tree view" rather than re-rendering everything on
    *  every git status poll — those fire on every save and focus change). */
   private readonly signatures = new Map<string, string>();
 
-  constructor(private readonly store: PersistenceStore) {}
+  /** Selected from `changelists.persistTo` on every discovery pass. Previously built once
+   *  during activation, which meant changing the setting did nothing until the window was
+   *  reloaded — and then silently started from an empty state in the other backend. */
+  private store: PersistenceStore;
+  private storeMode: PersistMode | undefined;
+
+  constructor(
+    private readonly memento: vscode.Memento,
+    private readonly shelves: ShelfStore
+  ) {
+    // Set before the first discovery pass completes, so the gap between activation and
+    // discovery shows the welcome content rather than an unexplained blank panel.
+    void vscode.commands.executeCommand('setContext', 'changelists.noRepo', true);
+    this.store = createPersistenceStore(this.config().persistTo, memento);
+    this.storeMode = this.config().persistTo;
+  }
+
+  /** Wired after construction, because the view needs this provider to exist first. Only
+   *  used for reveal(). */
+  setTreeView(view: vscode.TreeView<ChangelistTreeNode>): void {
+    this.treeView = view;
+  }
+
+  /** Scrolls to and selects a changelist. Creating one otherwise left the user hunting for
+   *  a new collapsed group somewhere in the list before they could put anything in it. */
+  async revealChangelist(context: RepositoryContext, changelistId: string): Promise<void> {
+    const node = this.nodeCache.get(this.nodeKey(context, changelistId));
+    if (!node || !this.treeView?.visible) {
+      return;
+    }
+    try {
+      await this.treeView.reveal(node, { select: true, focus: false, expand: true });
+    } catch {
+      // reveal() rejects if the node isn't currently in the rendered tree; not worth
+      // surfacing, since the list itself was still created.
+    }
+  }
+
+  /** Required for reveal(). A changelist's parent is its repo node in a multi-repo
+   *  workspace, and nothing at all when a single repo is rendered at the root. */
+  getParent(node: ChangelistTreeNode): ChangelistTreeNode | undefined {
+    if (node.kind === 'changelist' && this.contexts.length > 1) {
+      return this.repoNode(node.context);
+    }
+    if (node.kind === 'file' || node.kind === 'empty') {
+      return this.nodeCache.get(this.nodeKey(node.context, node.changelist.id));
+    }
+    return undefined;
+  }
+
+  private repoNode(context: RepositoryContext): RepoNode {
+    const key = context.repo.rootUri.toString();
+    const cached = this.repoNodeCache.get(key);
+    if (cached) {
+      return cached;
+    }
+    const created: RepoNode = { kind: 'repo', context };
+    this.repoNodeCache.set(key, created);
+    return created;
+  }
 
   /** Discovers repositories and (re)builds a context for each. Safe to call concurrently
    *  and re-entrantly: a call arriving mid-pass joins the running one and asks it to go
@@ -121,12 +188,14 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     return {
       defaultListName: cfg.get<string>('defaultListName', 'Default'),
       autoAssignToActive: cfg.get<boolean>('autoAssignNewFilesToActive', true),
+      persistTo: cfg.get<PersistMode>('persistTo', 'workspaceState'),
     };
   }
 
   private async rediscoverRepositories(pendingWrites: PendingWrites): Promise<void> {
-    const repos = await discoverRepositories();
+    const { repositories: repos, gitAvailable } = await discoverRepositories();
     void vscode.commands.executeCommand('setContext', 'changelists.noRepo', repos.length === 0);
+    void vscode.commands.executeCommand('setContext', 'changelists.gitUnavailable', !gitAvailable);
 
     // Settle the outgoing contexts before the loads below read the store again, so a
     // debounced write can't land on top of state we've already re-read.
@@ -141,9 +210,11 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     vscode.Disposable.from(...this.perPass).dispose();
     this.perPass = [];
     this.nodeCache.clear();
+    this.repoNodeCache.clear();
     this.signatures.clear();
 
-    const { defaultListName, autoAssignToActive } = this.config();
+    const { defaultListName, autoAssignToActive, persistTo } = this.config();
+    await this.adoptStore(persistTo, repos, defaultListName);
     this.contexts = [];
     for (const repo of repos) {
       let state;
@@ -163,8 +234,24 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       // shape-valid (passes isChangelistState) but has an empty changelists array,
       // which would otherwise violate ChangelistManager's "a default always exists"
       // invariant the first time getDefaultChangelist() is called.
+      // State written before 1.1 carries shelf payloads inline; move them into the shelf
+      // store so an existing shelve stays retrievable — and so a shared changelists.json
+      // stops carrying somebody's work-in-progress.
+      try {
+        const migrated = await migrateInlineShelves(this.shelves, repo.rootUri, state);
+        if (migrated) {
+          state = migrated;
+          await this.store.save(repo.rootUri, migrated);
+        }
+      } catch (err) {
+        void vscode.window.showWarningMessage(
+          `Changelists: could not move shelved contents out of the state file for "${repo.rootUri.fsPath}" — ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
       const manager = new ChangelistManager(state.changelists.length ? state : createEmptyState(defaultListName));
-      const context = new RepositoryContext(repo, manager, this.store, () => this.refreshChanged());
+      const context = new RepositoryContext(repo, manager, this.shelves, this.store, () => this.refreshChanged());
       this.perPass.push(
         context,
         // Debounced: this fires on every save, index touch and focus change, and a
@@ -186,6 +273,47 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       await context.refreshLiveChanges(autoAssignToActive);
     }
     this._onDidChangeTreeData.fire();
+  }
+
+  /** Switches backends when `changelists.persistTo` changed, carrying existing state over.
+   *
+   *  Without the copy, flipping the setting reads an empty destination, reconcile drops
+   *  every file into a fresh Default, and the next mutation persists that over the top —
+   *  so a settings change silently destroyed every changelist. Repos already set up in the
+   *  destination are left alone: the user configured those deliberately, and overwriting
+   *  them would trade one silent loss for another. */
+  private async adoptStore(mode: PersistMode, repos: readonly GitRepository[], defaultListName: string): Promise<void> {
+    if (this.storeMode === mode) {
+      return;
+    }
+    const previous = this.store;
+    this.store = createPersistenceStore(mode, this.memento);
+    this.storeMode = mode;
+
+    const migrated: string[] = [];
+    for (const repo of repos) {
+      try {
+        if ((await this.store.hasState(repo.rootUri)) || !(await previous.hasState(repo.rootUri))) {
+          continue;
+        }
+        await this.store.save(repo.rootUri, await previous.load(repo.rootUri, defaultListName));
+        migrated.push(repo.rootUri.path.split('/').filter(Boolean).pop() ?? repo.rootUri.fsPath);
+      } catch (err) {
+        // A single unreadable source (a conflicted file, a permissions problem) shouldn't
+        // stop the other repos migrating, and shouldn't abort the pass either.
+        void vscode.window.showWarningMessage(
+          `Changelists: could not carry changelists over for "${repo.rootUri.fsPath}" — ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    }
+    if (migrated.length > 0) {
+      const destination = mode === 'file' ? '.vscode/changelists.json' : "VS Code's workspace storage";
+      void vscode.window.showInformationMessage(
+        `Changelists: moved changelists for ${migrated.length === 1 ? `"${migrated[0]}"` : `${migrated.length} repositories`} to ${destination}.`
+      );
+    }
   }
 
   private async promptConflictResolution(err: ChangelistsConflictError): Promise<void> {
@@ -219,11 +347,18 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
    *  the ones whose signature moved. When the *set* of changelists changed, fall back to
    *  a full refresh, since added/removed groups can't be expressed as per-node events. */
   private refreshChanged(): void {
+    // Drives the undo button's visibility. Recomputed here because this is the one place
+    // every mutation funnels through.
+    void vscode.commands.executeCommand(
+      'setContext',
+      'changelists.canUndo',
+      this.contexts.some((c) => c.manager.undoableAction !== undefined)
+    );
     const nextSignatures = new Map<string, string>();
     const changedKeys: string[] = [];
 
     for (const context of this.contexts) {
-      const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
+      const grouped = context.grouped;
       for (const changelist of context.manager.getChangelists()) {
         const key = this.nodeKey(context, changelist.id);
         const entries = grouped.get(changelist.id) ?? [];
@@ -255,14 +390,29 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       this._onDidChangeTreeData.fire();
       return;
     }
+    let patched = false;
     for (const key of changedKeys) {
       const node = this.nodeCache.get(key);
-      // A changelist the user has never expanded has no cached node yet; there is
-      // nothing rendered to patch, so nothing to fire.
       if (node) {
         this._onDidChangeTreeData.fire(node);
+        patched = true;
       }
     }
+    // A changelist the user has never expanded has no cached node, so there is nothing
+    // rendered to patch — but other listeners still need to know. The status bar is one:
+    // without this, switching the active changelist from the status bar itself left the
+    // status bar showing the old name whenever the view had never been opened. Cheap,
+    // because "nothing is cached" means "nothing is rendered".
+    if (!patched && changedKeys.length > 0) {
+      this._onDidChangeTreeData.fire();
+    }
+  }
+
+  /** The parent folder, but only when another open repository shares this one's name —
+   *  so the extra text is paid for only in the workspaces that need it. */
+  private disambiguator(context: RepositoryContext): string | undefined {
+    const collides = this.contexts.some((other) => other !== context && other.label === context.label);
+    return collides ? context.parentLabel : undefined;
   }
 
   private nodeKey(context: RepositoryContext, changelistId: string): string {
@@ -288,7 +438,12 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       return undefined;
     }
     const picked = await vscode.window.showQuickPick(
-      this.contexts.map((c) => ({ label: c.label, context: c })),
+      this.contexts.map((c) => ({
+        label: c.label,
+        description: this.disambiguator(c),
+        detail: c.repo.rootUri.fsPath,
+        context: c,
+      })),
       { placeHolder: 'Select a repository' }
     );
     return picked?.context;
@@ -310,7 +465,7 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
   getChildren(node?: ChangelistTreeNode): ChangelistTreeNode[] {
     if (!node) {
       if (this.contexts.length > 1) {
-        return this.contexts.map((context) => ({ kind: 'repo', context }));
+        return this.contexts.map((context) => this.repoNode(context));
       }
       return this.contexts.length === 1 ? this.changelistNodes(this.contexts[0]) : [];
     }
@@ -318,10 +473,7 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       return this.changelistNodes(node.context);
     }
     if (node.kind === 'changelist') {
-      const grouped = node.context.manager.getFilesGroupedByChangelist(
-        node.context.liveChanges,
-        node.context.hunkIndex
-      );
+      const grouped = node.context.grouped;
       const entries = (grouped.get(node.changelist.id) ?? []).slice().sort((a, b) => a.filePath.localeCompare(b.filePath));
       if (entries.length === 0) {
         return [{ kind: 'empty', context: node.context, changelist: node.changelist }];
@@ -335,7 +487,17 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     return context.manager
       .getChangelists()
       .slice()
-      .sort((a, b) => (a.isDefault === b.isDefault ? 0 : a.isDefault ? 1 : -1))
+      // Default last, everything else by name. Previously the non-default lists kept
+      // whatever order the array happened to be in — creation order in a live session, but
+      // UUID order once reloaded from disk, so the tree silently rearranged itself on every
+      // restart.
+      .sort((a, b) =>
+        a.isDefault !== b.isDefault
+          ? a.isDefault
+            ? 1
+            : -1
+          : a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+      )
       .map((changelist) => {
         // Reuse the cached instance so refreshChanged()'s scoped fires match by
         // identity, but refresh its `changelist` payload — the Changelist objects are
@@ -356,14 +518,17 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
   private repoTreeItem(node: RepoNode): vscode.TreeItem {
     const item = new vscode.TreeItem(node.context.label, vscode.TreeItemCollapsibleState.Expanded);
     item.iconPath = new vscode.ThemeIcon('repo');
-    item.description = node.context.repo.branchName;
+    item.description = [this.disambiguator(node.context), node.context.repo.branchName]
+      .filter(Boolean)
+      .join(' · ');
+    item.tooltip = node.context.repo.rootUri.fsPath;
     item.contextValue = 'repo';
     return item;
   }
 
   private changelistTreeItem(node: ChangelistNode): vscode.TreeItem {
     const { changelist, context } = node;
-    const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
+    const grouped = context.grouped;
     const count = grouped.get(changelist.id)?.length ?? 0;
 
     if (changelist.shelf) {
@@ -389,10 +554,9 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
     item.tooltip = changelist.description
       ? `${changelist.name}\n${changelist.description}`
       : changelist.name;
-    // Bold, and a focusBorder-colored ring on the icon, is how the design spec (D1/L1
-    // in the reference mockup) marks the active list; TreeItem has no "bold" API of its
-    // own, so the resourceUri-less label styling comes from the icon distinction above
-    // plus the `(active)` suffix, which also keeps the state legible to screen readers.
+    // TreeItem has no "bold" API, and a FileDecoration would apply globally rather than
+    // to this view, so the active list is marked two ways instead: a filled icon (above)
+    // and the word "active" in the description — which is what a screen reader reads out.
     if (changelist.isActive) {
       item.description = `${count} · active`;
     }
@@ -422,6 +586,24 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
       item.tooltip = new vscode.MarkdownString(
         `**${entry.filePath}**\n\n${entry.kind} · shelved\n\n` +
           `Not in your working tree. Unshelve "${node.changelist.name}" to bring it back.`
+      );
+      return item;
+    }
+
+    if (entry.conflicted) {
+      // A conflicted file can be grouped and opened, but not split (its diff describes the
+      // conflict rather than a set of changes to apportion) and not committed. The distinct
+      // contextValue is what keeps Split Hunks off it.
+      item.contextValue = 'changelistFileConflicted';
+      item.description = dir ? `${dir}  conflict` : 'conflict';
+      item.iconPath = new vscode.ThemeIcon('warning');
+      item.resourceUri = uri;
+      item.id = `${context.repo.rootUri.toString()}::${node.changelist.id}::${entry.filePath}`;
+      item.command = { command: 'changelists.openFile', title: 'Open File', arguments: [node] };
+      item.tooltip = new vscode.MarkdownString(
+        `**${entry.filePath}**
+
+Unresolved merge conflict. Resolve it before committing this changelist.`
       );
       return item;
     }
@@ -482,6 +664,7 @@ export class ChangelistsTreeDataProvider implements vscode.TreeDataProvider<Chan
 }
 
 function reportInitializeFailure(err: unknown): void {
+  logError('Discovery failed', err);
   void vscode.window.showErrorMessage(
     `Changelists: could not load changelists — ${err instanceof Error ? err.message : String(err)}`
   );

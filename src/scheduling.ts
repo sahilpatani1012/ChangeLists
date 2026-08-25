@@ -98,3 +98,32 @@ export class Debouncer {
     return true;
   }
 }
+
+/** Maps `items` through `fn` with at most `limit` in flight, preserving input order.
+ *
+ *  Needed the moment a bare `Promise.all` fans out over process spawns: building the hunk
+ *  index diffs every modified file, so on a large repo that is one `git` process per
+ *  changed file, all at once. (`simple-git` used to cap this at five as a side effect of
+ *  its own scheduler; spawning directly means owning the limit rather than inheriting it.) */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}

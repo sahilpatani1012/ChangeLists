@@ -2,6 +2,89 @@
 
 All notable changes to the Changelists extension are documented here.
 
+## 1.1.0
+
+A correctness pass over 1.0.0, prompted by a full audit of the extension. The headline is
+that nothing here changes what the extension is for — it changes how often it does the
+right thing when git, the filesystem, or the user's configuration is not the happy path.
+
+**Data loss.** Shelving a modified binary file destroyed the change: the capture used
+`git diff` without `--binary`, which reports *that* a binary file differs but not *how*,
+and the working tree was reverted anyway. Every diff now flows through one hardened
+helper (`--binary`, `--no-color`, `--no-ext-diff`, `-U3`) with `diff.noprefix`,
+`diff.mnemonicPrefix` and `color.ui` pinned via `-c` — a user who set any of those turned
+every patch the extension generated into one `git apply` refuses to read, breaking
+unshelve and hunk-scoped commits. Captures are now validated *before* the working tree is
+touched, so a shelve that cannot be reversed does not happen at all.
+
+**Shelved contents no longer live in `.vscode/changelists.json`.** That file is the one
+the README tells teams to commit, and it held full patches and base64 copies of shelved
+work. Payloads moved to the extension's own workspace storage; the state file keeps only
+which paths are shelved. Existing shelves are migrated on load. Shelving refuses files
+over 16 MB.
+
+**Unshelve resumes instead of replaying.** A partial failure used to leave a
+half-restored tree and a shelf that could only ever replay patches `git apply` would
+reject — the "resolve the conflict and try again" the error suggested was not actually
+possible. What landed stays landed; only the rest stays shelved.
+
+**Switching `changelists.persistTo` no longer discards everything.** The setting had no
+effect until a window reload, and then started from an empty state in the other backend.
+The store is now selected per discovery pass and existing state is carried across.
+
+**Moving a split file's row moves that row.** Drag-and-drop and the context menu carried
+only file paths, so dropping the row under *Bugfix* relocated the whole file — moving the
+hunks you weren't touching and leaving Bugfix's behind. Every move now runs through one
+`moveRows()` method that knows the difference between a file and one changelist's share
+of it, and selecting every hunk is recognised as a whole-file move.
+
+**Shelved changelists can no longer be Active.** The guardrail was asserted in a comment
+and enforced nowhere, so newly modified files could auto-assign into a changelist whose
+contents are not in the working tree — where they simply vanished from the tree.
+
+**Merge conflicts appear.** `mergeChanges` was never read, so the panel under-reported
+during a merge or rebase and a scoped commit built from it silently excluded the
+conflicted files. Conflicted files now render as such and block a commit.
+
+**Also fixed:** discarding a renamed file or a staged new file failed outright
+(`pathspec did not match`); renaming a file and then editing it lost the rename linkage;
+hunk-scoped commits dropped the rename side; a transient `git diff` failure permanently
+deleted that file's hunk assignments; persistence failures were swallowed entirely;
+file-watcher registrations doubled on every reload in `file` mode; concurrent discovery
+passes could render a repository twice; refreshes raced each other; the tree recomputed
+its grouping twenty-one times per event on a ten-changelist repo; changelist order
+rearranged itself on every restart; the status bar went stale until the view was opened;
+and there were two Collapse All buttons.
+
+**`simple-git` is gone.** It accounted for most of the bundle while being used for little
+more than argument passing; a direct `child_process` wrapper replaces it. The production
+bundle drops from 118 KB to 60 KB, patches reach `git apply` over **stdin** instead of via
+a world-readable temp file in `os.tmpdir()`, failures carry git's own stderr rather than a
+paraphrase, and a missing `git` binary is now named as such. Diff concurrency is capped
+explicitly at 8 — previously it was bounded only as a side effect of the wrapper's own
+scheduler.
+
+**Undo.** *Undo Last Changelist Change* reverses the last grouping change: a move, rename,
+create, delete, or reunite. One step deep, grouping only — it cannot take back a commit, a
+discard, or a shelve. Reconciliation deliberately does not set the undo point, so an
+ordinary save can't bury what you wanted back.
+
+**Added:** an output channel recording what reconciliation moved; editable changelist
+descriptions (`ChangelistManager.setDescription` existed and was reachable from nowhere);
+keybindings within the view; multi-select for Open File, Open Diff and Discard Changes;
+a schema version with stricter state validation; and a distinct empty state for "git is
+disabled" versus "no repository here".
+
+**Testing.** Unit coverage is up from 39 tests to 105, including a suite that drives the
+real `git` binary. The integration suite now runs against a fixture repository in a real
+extension host, which is what finally verified — rather than assumed — that `vscode.git`
+reports the new path of a rename in `Change.uri`. A CI workflow runs the checks on Linux,
+Windows and macOS.
+
+**Still open, deliberately:** the commit message is still single-line. Multi-paragraph
+bodies need either a custom `SourceControlInputBox` or a webview, which is a feature
+rather than a fix.
+
 ## 1.0.0
 
 Completes the PRD: everything in the v1 MVP, v2, and the v3 review item is now built.

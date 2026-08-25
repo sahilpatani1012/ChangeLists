@@ -25,6 +25,14 @@ export class ChangelistsConflictError extends Error {
 export interface PersistenceStore {
   load(repoRoot: vscode.Uri, defaultListName: string): Promise<ChangelistState>;
   save(repoRoot: vscode.Uri, state: ChangelistState): Promise<void>;
+  /** Whether this backend holds anything at all for `repoRoot`.
+   *
+   *  Distinct from `load()` returning something empty: load substitutes a fresh Default
+   *  both when nothing was ever stored and when the stored state genuinely is one empty
+   *  list, so it cannot answer this. Migration between backends needs the difference —
+   *  copying over a repo the user has already set up in the destination would be worse
+   *  than not migrating at all. */
+  hasState(repoRoot: vscode.Uri): Promise<boolean>;
   /** Fires when the backing store changed underneath us (file mode only: a teammate's
    *  edit arriving via `git pull`, a branch switch, a hand edit). No-op for
    *  workspaceState, which only this extension instance can write. */
@@ -36,6 +44,10 @@ class WorkspaceStateStore implements PersistenceStore {
 
   private key(repoRoot: vscode.Uri): string {
     return `${STATE_KEY}:${repoRoot.toString()}`;
+  }
+
+  async hasState(repoRoot: vscode.Uri): Promise<boolean> {
+    return this.memento.get(this.key(repoRoot)) !== undefined;
   }
 
   async load(repoRoot: vscode.Uri, defaultListName: string): Promise<ChangelistState> {
@@ -56,6 +68,15 @@ class FileStore implements PersistenceStore {
 
   private fileUri(repoRoot: vscode.Uri): vscode.Uri {
     return vscode.Uri.joinPath(repoRoot, FILE_RELATIVE_PATH);
+  }
+
+  async hasState(repoRoot: vscode.Uri): Promise<boolean> {
+    try {
+      await vscode.workspace.fs.stat(this.fileUri(repoRoot));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async load(repoRoot: vscode.Uri, defaultListName: string): Promise<ChangelistState> {

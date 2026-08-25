@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { errorMessage, isActionable, resolveChangelistTarget } from './shared';
+import { autoAssignSetting, errorMessage, isActionable, resolveChangelistTarget } from './shared';
 import { buildSubsetPatch, parseUnifiedDiff } from '../hunks';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 
@@ -29,10 +29,25 @@ export async function commitChangelistCommand(
   }
   const { context, changelist } = target;
 
-  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
-  const entries = grouped.get(changelist.id) ?? [];
+  // Re-read status before building the file set: `liveChanges` is only as fresh as the
+  // last git event, and this command then walks the user through two or three prompts
+  // before committing. Committing a stale path fails with git's own "pathspec did not
+  // match", which reads like a bug in the extension rather than a race.
+  await context.refreshLiveChanges(autoAssignSetting());
+
+  const entries = context.grouped.get(changelist.id) ?? [];
   if (entries.length === 0) {
     void vscode.window.showInformationMessage(`"${changelist.name}" has no files to commit.`);
+    return;
+  }
+
+  const conflicted = entries.filter((e) => e.conflicted);
+  if (conflicted.length > 0) {
+    void vscode.window.showErrorMessage(
+      `"${changelist.name}" contains ${
+        conflicted.length === 1 ? `an unresolved merge conflict in "${conflicted[0].filePath}"` : `${conflicted.length} unresolved merge conflicts`
+      }. Resolve ${conflicted.length === 1 ? 'it' : 'them'} before committing.`
+    );
     return;
   }
 
@@ -124,10 +139,7 @@ export async function commitChangelistCommand(
       }
     );
     void vscode.window.showInformationMessage(`Committed ${scopeNote} to "${changelist.name}".`);
-    const autoAssignToActive = vscode.workspace
-      .getConfiguration('changelists')
-      .get<boolean>('autoAssignNewFilesToActive', true);
-    await context.refreshLiveChanges(autoAssignToActive);
+    await context.refreshLiveChanges(autoAssignSetting());
   } catch (err) {
     void vscode.window.showErrorMessage(`Commit failed: ${errorMessage(err)}`);
   }

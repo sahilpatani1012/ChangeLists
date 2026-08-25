@@ -45,6 +45,9 @@ export async function createChangelistCommand(
 
   try {
     const changelist = context.manager.createChangelist(name, description);
+    // Scroll to it and select it: a new list is empty by definition, so the next thing the
+    // user wants is to put something in it, which means finding it first.
+    void provider.revealChangelist(context, changelist.id);
     return { context, changelistId: changelist.id };
   } catch (err) {
     void vscode.window.showErrorMessage(errorMessage(err));

@@ -1,5 +1,4 @@
 import { createHash } from 'crypto';
-import { RepoRelativePath } from './types';
 
 /** Unified-diff parsing and subset-patch generation for hunk-level changelists
  *  (PRD §10 v2). Pure functions over strings — no `vscode`, no `git`, no I/O — so the
@@ -76,6 +75,13 @@ export function parseUnifiedDiff(diff: string): ParsedDiff | undefined {
     i++;
     while (i < lines.length && !HUNK_HEADER.test(lines[i])) {
       const line = lines[i];
+      // A second file's header ends this one. Every caller diffs a single path, so this
+      // should not arise — but swallowing it into the previous hunk's body would produce a
+      // subset patch silently carrying another file's content, which is worse than
+      // refusing to parse past it.
+      if (line.startsWith('diff --git ')) {
+        return hunks.length > 0 ? { header, hunks } : undefined;
+      }
       // A trailing empty string from the final "\n" split isn't part of the hunk.
       if (line === '' && i === lines.length - 1) {
         i++;
@@ -127,7 +133,10 @@ export function buildSubsetPatch(parsed: ParsedDiff, selectedIds: ReadonlySet<st
   const out: string[] = [parsed.header];
   let delta = 0;
   for (const hunk of selected) {
-    const newStart = hunk.oldStart + delta;
+    // `-0,0` marks an insertion before the first line; its `+` side still starts at 1, and
+    // a naive `oldStart + delta` would emit `+0`, which git rejects. Only reachable with
+    // zero context, which is why -U3 has kept this out of sight rather than out of scope.
+    const newStart = hunk.oldStart === 0 ? Math.max(1, 1 + delta) : hunk.oldStart + delta;
     const newCount = hunk.oldCount + (hunk.additions - hunk.deletions);
     out.push(formatHunkHeader(hunk.oldStart, hunk.oldCount, newStart, newCount, hunk.heading));
     out.push(...hunk.lines);
@@ -194,11 +203,4 @@ export function describePatchDefect(patch: string): string | undefined {
     return 'git summarised a binary file instead of encoding its contents';
   }
   return undefined;
-}
-
-/** A file whose hunks are split across more than one changelist. */
-export interface SplitFileSummary {
-  readonly filePath: RepoRelativePath;
-  readonly ownedHunks: number;
-  readonly totalHunks: number;
 }
