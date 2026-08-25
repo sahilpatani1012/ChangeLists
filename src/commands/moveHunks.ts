@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { createChangelistCommand } from './createChangelist';
-import { errorMessage } from './shared';
+import { errorMessage, refreshAfterHunkChange } from './shared';
 import { describeHunk, parseUnifiedDiff, summarizeHunkCounts } from '../hunks';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode, FileNode } from '../treeDataProvider';
 
@@ -51,14 +51,20 @@ export async function splitHunksCommand(
 
   const overrides = context.manager.getHunkOverrides(entry.filePath);
   const fileOwner = context.manager.getChangelistIdForFile(entry.filePath);
+  const ownerName = (id: string | undefined): string =>
+    (id ? context.manager.getChangelist(id)?.name : undefined) ?? 'no changelist';
 
+  // Nothing is pre-checked. The prompt asks which hunks to move, so arriving with this
+  // changelist's hunks already ticked meant accepting the default moved everything — a
+  // whole-file move wearing a split's clothing — and the user had to *un*tick what they
+  // wanted to keep. Current ownership is shown per row instead, which is the information
+  // the pre-checking was really carrying.
   type HunkItem = vscode.QuickPickItem & { hunkId: string };
   const items: HunkItem[] = parsed.hunks.map((hunk, i) => ({
     label: `$(diff) Hunk ${i + 1}: ${describeHunk(hunk)}`,
-    description: summarizeHunkCounts(hunk),
+    description: `${summarizeHunkCounts(hunk)}  ·  in ${ownerName(overrides.get(hunk.id) ?? fileOwner)}`,
     detail: `line ${hunk.newStart}`,
     hunkId: hunk.id,
-    picked: (overrides.get(hunk.id) ?? fileOwner) === fileNode.changelist.id,
   }));
 
   const chosen = await vscode.window.showQuickPick(items, {
@@ -102,16 +108,28 @@ export async function splitHunksCommand(
   }
 
   try {
+    // totalHunks lets the manager recognise "every hunk selected" as a whole-file move,
+    // rather than leaving the file assigned to one changelist while all of its hunks
+    // override to another.
     context.manager.assignHunks(
       entry.filePath,
       chosen.map((c) => c.hunkId),
-      targetId
+      targetId,
+      { totalHunks: parsed.hunks.length }
     );
-    const targetName = context.manager.getChangelist(targetId)?.name ?? 'the changelist';
-    void vscode.window.showInformationMessage(`Moved ${chosen.length} ${hunkWord} to "${targetName}".`);
   } catch (err) {
     void vscode.window.showErrorMessage(errorMessage(err));
+    return;
   }
+  // The hunk index is only built once some file has overrides, so without this the very
+  // first split of a session renders as a whole file until an unrelated git event lands.
+  await refreshAfterHunkChange(context);
+  const targetName = context.manager.getChangelist(targetId)?.name ?? 'the changelist';
+  void vscode.window.showInformationMessage(
+    chosen.length === parsed.hunks.length
+      ? `Moved all of "${entry.filePath}" to "${targetName}".`
+      : `Moved ${chosen.length} ${hunkWord} to "${targetName}".`
+  );
 }
 
 /** "Reunite Hunks" — drops every per-hunk override for a file so it belongs wholly to
@@ -127,6 +145,7 @@ export async function reuniteHunksCommand(node?: ChangelistTreeNode): Promise<vo
     return;
   }
   context.manager.clearHunkAssignments(entry.filePath);
+  await refreshAfterHunkChange(context);
   const owner = context.manager.getChangelistIdForFile(entry.filePath);
   const ownerName = owner ? context.manager.getChangelist(owner)?.name : undefined;
   void vscode.window.showInformationMessage(

@@ -4,9 +4,11 @@ import {
   ChangelistAssignment,
   ChangelistFileEntry,
   ChangelistState,
+  DroppedHunkAssignment,
   GitFileChange,
   HunkAssignment,
   HunkIndex,
+  MovableRow,
   ReconciliationResult,
   RepoRelativePath,
   ShelfInfo,
@@ -20,12 +22,50 @@ export class ChangelistManager {
   private _state: ChangelistState;
   private readonly listeners = new Set<() => void>();
 
+  /** The state as it was before the last mutation, for undo.
+   *
+   *  Nearly free, because state is already immutable and replaced wholesale on every
+   *  mutation — the previous object is sitting there either way. One step deep on purpose:
+   *  this is a safety net for "that moved the wrong thing", not a history, and a deeper
+   *  stack would invite the expectation that it survives a reload, which it does not. */
+  private _undoState: ChangelistState | undefined;
+  private _undoLabel: string | undefined;
+
   constructor(initialState: ChangelistState) {
     this._state = initialState;
   }
 
   get state(): Readonly<ChangelistState> {
     return this._state;
+  }
+
+  /** What undo() would reverse, for the menu and the confirmation, or undefined when
+   *  there is nothing to undo. */
+  get undoableAction(): string | undefined {
+    return this._undoLabel;
+  }
+
+  /** Restores the state from before the last mutation. Returns what it reversed. */
+  undo(): string | undefined {
+    if (!this._undoState) {
+      return undefined;
+    }
+    const label = this._undoLabel;
+    this._state = this._undoState;
+    // Deliberately not stacking: undoing is itself a mutation, but making it undoable
+    // would turn one keystroke into a toggle nobody asked for.
+    this._undoState = undefined;
+    this._undoLabel = undefined;
+    this.notify();
+    return label;
+  }
+
+  /** Records the current state as the undo point, under a human-readable label. Called by
+   *  the mutations a user performs deliberately — not by reconcile(), which reacts to git
+   *  rather than to the user, and whose churn would otherwise bury the real undo point. */
+  private checkpoint(label: string): void {
+    this._undoState = this._state;
+    this._undoLabel = label;
   }
 
   /** Fires after every mutating call (create/rename/delete/assign/reconcile/setActive).
@@ -58,8 +98,15 @@ export class ChangelistManager {
     return found;
   }
 
+  /** The list reconcile() drops newly modified files into.
+   *
+   *  A shelved list is skipped even if it is somehow flagged active — setActiveChangelist()
+   *  refuses to make one active and normalize() clears the flag on load, so this is the
+   *  third line of defence rather than the first. It matters because the failure is
+   *  invisible: a shelved list renders its snapshot instead of live git status, so files
+   *  auto-assigned into one simply disappear from the tree until it is unshelved. */
   getActiveChangelist(): Changelist {
-    return this._state.changelists.find((c) => c.isActive) ?? this.getDefaultChangelist();
+    return this._state.changelists.find((c) => c.isActive && !c.shelf) ?? this.getDefaultChangelist();
   }
 
   /** Case-insensitive uniqueness check used both internally and by command-side
@@ -79,6 +126,7 @@ export class ChangelistManager {
     if (!this.isNameAvailable(trimmed)) {
       throw new Error(`A changelist named "${trimmed}" already exists.`);
     }
+    this.checkpoint(`creating "${trimmed}"`);
     const changelist: Changelist = {
       id: randomUUID(),
       name: trimmed,
@@ -100,6 +148,7 @@ export class ChangelistManager {
     if (!target) {
       throw new Error('Changelist not found.');
     }
+    this.checkpoint(`renaming "${target.name}"`);
     this._state = {
       ...this._state,
       changelists: this._state.changelists.map((c) => (c.id === id ? { ...c, name: trimmed } : c)),
@@ -111,6 +160,7 @@ export class ChangelistManager {
     if (!this.getChangelist(id)) {
       throw new Error('Changelist not found.');
     }
+    this.checkpoint('editing a description');
     this._state = {
       ...this._state,
       changelists: this._state.changelists.map((c) =>
@@ -136,6 +186,7 @@ export class ChangelistManager {
     if (target.shelf) {
       throw new Error(`"${target.name}" is shelved. Unshelve it before deleting, so its shelved work isn't orphaned.`);
     }
+    this.checkpoint(`deleting "${target.name}"`);
     const defaultList = this.getDefaultChangelist();
     const movedFilePaths: RepoRelativePath[] = [];
     const nextAssignments = this._state.assignments.map((a) => {
@@ -163,9 +214,17 @@ export class ChangelistManager {
   }
 
   setActiveChangelist(id: string): void {
-    if (!this.getChangelist(id)) {
+    const target = this.getChangelist(id);
+    if (!target) {
       throw new Error('Changelist not found.');
     }
+    if (target.shelf) {
+      // Without this the shelve/unshelve guardrails are decorative: newly modified files
+      // auto-assign into the active list, so activating a shelved one strands them inside
+      // a changelist whose contents aren't in the working tree at all.
+      throw new Error(`"${target.name}" is shelved; unshelve it before making it active.`);
+    }
+    this.checkpoint(`activating "${target.name}"`);
     this._state = {
       ...this._state,
       changelists: this._state.changelists.map((c) => ({ ...c, isActive: c.id === id })),
@@ -231,26 +290,42 @@ export class ChangelistManager {
       throw new Error('That changelist is not shelved.');
     }
     const shelf = target.shelf;
-    const restored: ChangelistAssignment[] = shelf.files.map((f) => ({
-      filePath: f.filePath,
-      changelistId: id,
-    }));
-    const restoredPaths = new Set(restored.map((r) => r.filePath));
+    this.applyUnshelved(id, shelf.files.map((f) => f.filePath));
+    return shelf;
+  }
+
+  /** Records that some of a shelf's files made it back into the working tree.
+   *
+   *  Anything still shelved stays shelved, so a retry after a partial failure resumes
+   *  instead of replaying patches that already applied — `git apply` cannot apply the same
+   *  patch twice, so replaying is not merely wasteful but guaranteed to fail. Returns how
+   *  many files are still waiting, so the caller can word the result honestly. */
+  applyUnshelved(id: string, restoredPaths: readonly RepoRelativePath[]): { remaining: number } {
+    const target = this.getChangelist(id);
+    if (!target?.shelf) {
+      throw new Error('That changelist is not shelved.');
+    }
+    const done = new Set(restoredPaths);
+    const stillShelved = target.shelf.files.filter((f) => !done.has(f.filePath));
+    const restored: ChangelistAssignment[] = [...done].map((filePath) => ({ filePath, changelistId: id }));
+
     this._state = {
       ...this._state,
       changelists: this._state.changelists.map((c) =>
-        c.id === id ? { ...c, shelf: undefined } : c
+        c.id === id
+          ? { ...c, shelf: stillShelved.length > 0 ? { ...target.shelf!, files: stillShelved } : undefined }
+          : c
       ),
       // Drop any assignment that has since been created for the same path in another
       // list (the user modified the file again while it was shelved) — the unshelved
       // list wins, since the user explicitly asked for its contents back.
-      assignments: [...this._state.assignments.filter((a) => !restoredPaths.has(a.filePath)), ...restored],
+      assignments: [...this._state.assignments.filter((a) => !done.has(a.filePath)), ...restored],
       // Likewise for hunk overrides on those paths: the shelved snapshot is whole-file,
       // so any split created while it was away no longer describes this content.
-      hunkAssignments: (this._state.hunkAssignments ?? []).filter((h) => !restoredPaths.has(h.filePath)),
+      hunkAssignments: (this._state.hunkAssignments ?? []).filter((h) => !done.has(h.filePath)),
     };
     this.notify();
-    return shelf;
+    return { remaining: stillShelved.length };
   }
 
   getChangelistIdForFile(filePath: RepoRelativePath): string | undefined {
@@ -261,7 +336,27 @@ export class ChangelistManager {
     this.assignFiles([filePath], changelistId);
   }
 
+  /** Moves whole files. Any per-hunk override on a moved path is dropped: the file is
+   *  going somewhere as a unit, so a split of it no longer describes anything. */
   assignFiles(filePaths: readonly RepoRelativePath[], changelistId: string): void {
+    this.moveRows(
+      filePaths.map((filePath) => ({ filePath, changelistId: '' })),
+      changelistId
+    );
+  }
+
+  /** Moves whatever the given tree rows represent into `changelistId`.
+   *
+   *  This exists because "move this row" and "move this file" are not the same operation
+   *  once a file is split. A split file renders one row per owning changelist, each
+   *  showing only that changelist's share — so moving the row under *Bugfix* must move
+   *  Bugfix's hunks, not relocate the file. Routing every move (drag-and-drop, the context
+   *  menu, the hunk picker) through one method is what keeps those two cases from drifting
+   *  apart again.
+   *
+   *  Applied as a single state replacement so a multi-row move is one mutation — one
+   *  persist, one tree refresh — rather than N of each. */
+  moveRows(rows: readonly MovableRow[], changelistId: string): void {
     const target = this.getChangelist(changelistId);
     if (!target) {
       throw new Error('Changelist not found.');
@@ -269,10 +364,71 @@ export class ChangelistManager {
     if (target.shelf) {
       throw new Error(`"${target.name}" is shelved; unshelve it before moving files into it.`);
     }
-    const targets = new Set(filePaths);
-    const remaining = this._state.assignments.filter((a) => !targets.has(a.filePath));
-    const additions: ChangelistAssignment[] = filePaths.map((filePath) => ({ filePath, changelistId }));
-    this._state = { ...this._state, assignments: [...remaining, ...additions] };
+
+    const wholeFiles = new Set<RepoRelativePath>();
+    const hunkMoves = new Map<RepoRelativePath, Set<string>>();
+    const totalHunksByPath = new Map<RepoRelativePath, number>();
+    for (const row of rows) {
+      if (row.totalHunks !== undefined) {
+        totalHunksByPath.set(row.filePath, row.totalHunks);
+      }
+      if (!row.hunkIds || row.hunkIds.length === 0) {
+        wholeFiles.add(row.filePath);
+        continue;
+      }
+      const moving = hunkMoves.get(row.filePath) ?? new Set<string>();
+      for (const hunkId of row.hunkIds) {
+        moving.add(hunkId);
+      }
+      hunkMoves.set(row.filePath, moving);
+    }
+
+    // A selection covering every hunk of a file is a whole-file move — whether it came
+    // from one row (the picker, with everything ticked) or from selecting all of a split
+    // file's rows at once. Checked after the union rather than per row, because neither
+    // half of a two-row selection covers the file on its own. Leaving the file-level
+    // assignment behind here would list the file under a changelist that owns none of it,
+    // and hand its hunks to Default the next time the destination was deleted.
+    for (const [filePath, moving] of hunkMoves) {
+      const total = totalHunksByPath.get(filePath);
+      if (total !== undefined && moving.size >= total) {
+        wholeFiles.add(filePath);
+      }
+    }
+    for (const filePath of wholeFiles) {
+      hunkMoves.delete(filePath);
+    }
+
+    this.checkpoint(rows.length === 1 ? `moving "${rows[0].filePath}"` : `moving ${rows.length} files`);
+    let assignments: ChangelistAssignment[] = this._state.assignments;
+    let hunkAssignments: HunkAssignment[] = [...this.hunkAssignments];
+
+    if (wholeFiles.size > 0) {
+      assignments = [
+        ...assignments.filter((a) => !wholeFiles.has(a.filePath)),
+        ...[...wholeFiles].map((filePath): ChangelistAssignment => ({ filePath, changelistId })),
+      ];
+      hunkAssignments = hunkAssignments.filter((h) => !wholeFiles.has(h.filePath));
+    }
+
+    for (const [filePath, moving] of hunkMoves) {
+      const fileOwner = assignments.find((a) => a.filePath === filePath)?.changelistId;
+      if (!fileOwner) {
+        // Not in any changelist yet, so there is no file-level assignment for these hunks
+        // to be an exception to. Skipped rather than thrown: one unassignable path
+        // shouldn't abort a multi-row move.
+        continue;
+      }
+      const kept = hunkAssignments.filter((h) => h.filePath !== filePath || !moving.has(h.hunkId));
+      // Hunks landing back on the file's own changelist drop their override rather than
+      // being stored redundantly, which is what lets isSplit() stay honest and lets a
+      // fully-reunited file return to the cheap non-split rendering path.
+      const added: HunkAssignment[] =
+        changelistId === fileOwner ? [] : [...moving].map((hunkId) => ({ filePath, hunkId, changelistId }));
+      hunkAssignments = [...kept, ...added];
+    }
+
+    this._state = { ...this._state, assignments, hunkAssignments };
     this.notify();
   }
 
@@ -305,6 +461,28 @@ export class ChangelistManager {
         result.carriedOverRenames.push({
           from: assignment.filePath,
           to: renameMatch.filePath,
+          changelistId: assignment.changelistId,
+        });
+        continue;
+      }
+      // Last resort before dropping: match ignoring case. On Windows and macOS the same
+      // file can be reported under different casing than the assignment was stored with
+      // (a workspace reopened via a differently-cased path, a case-only rename), and
+      // dropping here would silently move the user's file to Default. Re-keyed to the
+      // casing git is reporting now, so the next pass matches exactly.
+      const caseMatch = liveChanges.find(
+        (c) =>
+          !consumedRenameTargets.has(c.filePath) &&
+          c.filePath !== assignment.filePath &&
+          c.filePath.toLowerCase() === assignment.filePath.toLowerCase() &&
+          !this._state.assignments.some((a) => a.filePath === c.filePath)
+      );
+      if (caseMatch) {
+        consumedRenameTargets.add(caseMatch.filePath);
+        nextAssignments.push({ filePath: caseMatch.filePath, changelistId: assignment.changelistId });
+        result.carriedOverRenames.push({
+          from: assignment.filePath,
+          to: caseMatch.filePath,
           changelistId: assignment.changelistId,
         });
         continue;
@@ -427,29 +605,22 @@ export class ChangelistManager {
     return this.hunkAssignments.some((h) => h.filePath === filePath && h.changelistId !== fileOwner);
   }
 
-  /** Moves specific hunks of `filePath` into `changelistId`. Hunks landing back on the
-   *  file's own changelist drop their override rather than being stored redundantly,
-   *  which is what lets isSplit() stay honest and lets a fully-reunited file return to
-   *  the cheap non-split rendering path. */
-  assignHunks(filePath: RepoRelativePath, hunkIds: readonly string[], changelistId: string): void {
-    const target = this.getChangelist(changelistId);
-    if (!target) {
-      throw new Error('Changelist not found.');
-    }
-    if (target.shelf) {
-      throw new Error(`"${target.name}" is shelved; unshelve it before moving hunks into it.`);
-    }
-    const fileOwner = this.getChangelistIdForFile(filePath);
-    if (!fileOwner) {
+  /** Moves specific hunks of `filePath` into `changelistId`.
+   *
+   *  Pass `totalHunks` wherever the caller knows it (the hunk picker does, the tree rows
+   *  do): selecting every hunk is then recognised as a whole-file move rather than
+   *  producing a file whose assignment says one changelist while every one of its hunks
+   *  says another. */
+  assignHunks(
+    filePath: RepoRelativePath,
+    hunkIds: readonly string[],
+    changelistId: string,
+    options: { totalHunks?: number } = {}
+  ): void {
+    if (!this.getChangelistIdForFile(filePath)) {
       throw new Error('That file is not in any changelist yet.');
     }
-    const moving = new Set(hunkIds);
-    const kept = this.hunkAssignments.filter((h) => h.filePath !== filePath || !moving.has(h.hunkId));
-    const added: HunkAssignment[] =
-      changelistId === fileOwner ? [] : hunkIds.map((hunkId) => ({ filePath, hunkId, changelistId }));
-
-    this._state = { ...this._state, hunkAssignments: [...kept, ...added] };
-    this.notify();
+    this.moveRows([{ filePath, changelistId: '', hunkIds, totalHunks: options.totalHunks }], changelistId);
   }
 
   /** Reunites every hunk of `filePath` under the file's own changelist. */
@@ -457,6 +628,7 @@ export class ChangelistManager {
     if (!this.hunkAssignments.some((h) => h.filePath === filePath)) {
       return;
     }
+    this.checkpoint(`reuniting "${filePath}"`);
     this._state = {
       ...this._state,
       hunkAssignments: this.hunkAssignments.filter((h) => h.filePath !== filePath),
@@ -473,19 +645,35 @@ export class ChangelistManager {
    *  That is the deliberate conservative choice called for by PRD §12's "defensive
    *  fallback rather than dropping data" guidance: the file itself keeps its assignment,
    *  only the finer-grained override lapses. */
-  reconcileHunks(hunkIndex: HunkIndex): { droppedHunkAssignments: HunkAssignment[] } {
-    const dropped: HunkAssignment[] = [];
+  reconcileHunks(
+    hunkIndex: HunkIndex,
+    options: { undiffable?: ReadonlySet<RepoRelativePath> } = {}
+  ): { droppedHunkAssignments: DroppedHunkAssignment[] } {
+    const dropped: DroppedHunkAssignment[] = [];
     const kept: HunkAssignment[] = [];
     const liveChangelistIds = new Set(this._state.changelists.map((c) => c.id));
 
     for (const h of this.hunkAssignments) {
-      const hunksForFile = hunkIndex.get(h.filePath);
-      const stillExists = hunksForFile?.includes(h.hunkId) ?? false;
-      if (stillExists && liveChangelistIds.has(h.changelistId) && this.getChangelistIdForFile(h.filePath)) {
+      // "We could not read this file's diff" is not "this hunk is gone". Treating them the
+      // same turns one flaky `git diff` — a momentary index lock, a file briefly held open
+      // — into the permanent, silent loss of a split the user set up by hand.
+      if (options.undiffable?.has(h.filePath)) {
         kept.push(h);
-      } else {
-        dropped.push(h);
+        continue;
       }
+      if (!liveChangelistIds.has(h.changelistId)) {
+        dropped.push({ ...h, reason: 'changelist-gone' });
+        continue;
+      }
+      if (!this.getChangelistIdForFile(h.filePath)) {
+        dropped.push({ ...h, reason: 'file-gone' });
+        continue;
+      }
+      if (!(hunkIndex.get(h.filePath)?.includes(h.hunkId) ?? false)) {
+        dropped.push({ ...h, reason: 'hunk-changed' });
+        continue;
+      }
+      kept.push(h);
     }
 
     if (dropped.length > 0) {

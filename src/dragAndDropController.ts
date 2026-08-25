@@ -1,12 +1,22 @@
 import * as vscode from 'vscode';
 import { ChangelistTreeNode } from './treeDataProvider';
-import { RepoRelativePath } from './types';
+import { MovableRow } from './types';
 
-const MIME_TYPE = 'application/vnd.code.tree.changelistsview';
+// VS Code derives a tree's own drag type from its view id, lower-cased — for
+// `changelists.view` that is this string. A custom type would also work, but matching
+// the convention keeps this view consistent with how every built-in tree advertises
+// itself, rather than depending on custom types staying permitted.
+const MIME_TYPE = 'application/vnd.code.tree.changelists.view';
 
+/** Carries the *rows* being dragged, not just their paths.
+ *
+ *  A split file renders one row per owning changelist, each showing only that
+ *  changelist's share. Sending paths alone loses which share was grabbed, so dropping the
+ *  row under "Bugfix" onto "Feature" relocated the file instead — moving the hunks the
+ *  user wasn't touching and leaving Bugfix's behind. */
 interface DragPayload {
   repoRoot: string;
-  filePaths: RepoRelativePath[];
+  rows: MovableRow[];
 }
 
 /** Drag-and-drop between changelist groups (PRD §7.2/§7.4, mockup D3/L3: source rows
@@ -23,12 +33,20 @@ export class ChangelistsDragAndDropController implements vscode.TreeDragAndDropC
     if (fileNodes.length === 0) {
       return;
     }
-    // All selected file nodes are necessarily from the same repo context — VS Code's
-    // TreeView selection can't span multiple views, and our repo nodes are the only
-    // level above changelists, so a multi-select drag is always single-repo.
+    // A multi-root workspace renders a node per repository and a selection can span them,
+    // so the drag is restricted to the repo the first row belongs to; handleDrop() rejects
+    // anything from elsewhere. Changelists are per-repository (PRD §4 non-goals), so there
+    // is nothing coherent a cross-repo drag could mean.
     const payload: DragPayload = {
       repoRoot: fileNodes[0].context.repo.rootUri.toString(),
-      filePaths: fileNodes.map((n) => n.entry.filePath),
+      rows: fileNodes
+        .filter((n) => n.context === fileNodes[0].context)
+        .map((n) => ({
+        filePath: n.entry.filePath,
+        changelistId: n.changelist.id,
+        hunkIds: n.entry.split?.hunkIds,
+        totalHunks: n.entry.split?.totalHunks,
+      })),
     };
     dataTransfer.set(MIME_TYPE, new vscode.DataTransferItem(JSON.stringify(payload)));
   }
@@ -60,7 +78,15 @@ export class ChangelistsDragAndDropController implements vscode.TreeDragAndDropC
     if (!targetChangelistId) {
       return;
     }
-    target.context.manager.assignFiles(payload.filePaths, targetChangelistId);
+    try {
+      target.context.manager.moveRows(payload.rows ?? [], targetChangelistId);
+    } catch (err) {
+      // moveRows() refuses a shelved destination. Without this the rejection vanished
+      // into VS Code's drop handler: the files simply didn't move and nothing said why.
+      void vscode.window.showErrorMessage(
+        `Changelists: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 }
 

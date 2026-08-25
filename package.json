@@ -2,7 +2,7 @@
   "name": "changelists",
   "displayName": "Changelists",
   "description": "JetBrains/WebStorm-style named changelists for grouping and committing related file changes independently in VS Code.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "changelists-dev",
   "license": "MIT",
   "engines": {
@@ -13,7 +13,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onView:changelists.view",
+    "workspaceContains:**/.git"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -40,21 +41,32 @@
       {
         "view": "changelists.view",
         "contents": "No git repository detected in this workspace.\n[Open Folder](command:vscode.openFolder)",
-        "when": "changelists.noRepo"
+        "when": "changelists.noRepo && !changelists.gitUnavailable"
+      },
+      {
+        "view": "changelists.view",
+        "contents": "Changelists needs VS Code's built-in Git extension, which is currently disabled or unavailable.\n[Open Settings](command:workbench.action.openSettings?%22git.enabled%22)",
+        "when": "changelists.gitUnavailable"
       }
     ],
     "commands": [
       {
         "command": "changelists.createChangelist",
-        "title": "New Changelist…",
+        "title": "New Changelist\u2026",
         "category": "Changelists",
         "icon": "$(add)"
       },
       {
         "command": "changelists.renameChangelist",
-        "title": "Rename…",
+        "title": "Rename\u2026",
         "category": "Changelists",
         "icon": "$(edit)"
+      },
+      {
+        "command": "changelists.editDescription",
+        "title": "Edit Description\u2026",
+        "category": "Changelists",
+        "icon": "$(note)"
       },
       {
         "command": "changelists.deleteChangelist",
@@ -69,12 +81,12 @@
       },
       {
         "command": "changelists.switchActiveChangelist",
-        "title": "Switch Active Changelist…",
+        "title": "Switch Active Changelist\u2026",
         "category": "Changelists"
       },
       {
         "command": "changelists.commitChangelist",
-        "title": "Commit Changelist…",
+        "title": "Commit Changelist\u2026",
         "category": "Changelists",
         "icon": "$(check)"
       },
@@ -86,7 +98,7 @@
       },
       {
         "command": "changelists.splitHunks",
-        "title": "Split Hunks to Changelist…",
+        "title": "Split Hunks to Changelist\u2026",
         "category": "Changelists",
         "icon": "$(diff)"
       },
@@ -110,7 +122,7 @@
       },
       {
         "command": "changelists.moveSelectionToChangelist",
-        "title": "Move to Changelist…",
+        "title": "Move to Changelist\u2026",
         "category": "Changelists"
       },
       {
@@ -142,6 +154,12 @@
         "title": "Collapse All",
         "category": "Changelists",
         "icon": "$(collapse-all)"
+      },
+      {
+        "command": "changelists.undo",
+        "title": "Undo Last Changelist Change",
+        "category": "Changelists",
+        "icon": "$(discard)"
       }
     ],
     "menus": {
@@ -157,8 +175,8 @@
           "group": "navigation@2"
         },
         {
-          "command": "changelists.collapseAll",
-          "when": "view == changelists.view",
+          "command": "changelists.undo",
+          "when": "view == changelists.view && changelists.canUndo",
           "group": "navigation@3"
         }
       ],
@@ -209,6 +227,11 @@
           "group": "3_destructive@1"
         },
         {
+          "command": "changelists.unshelveChangelist",
+          "when": "view == changelists.view && viewItem == shelvedFile",
+          "group": "1_actions@1"
+        },
+        {
           "command": "changelists.openFile",
           "when": "view == changelists.view && viewItem =~ /^changelistFile/",
           "group": "inline@1"
@@ -235,7 +258,7 @@
         },
         {
           "command": "changelists.splitHunks",
-          "when": "view == changelists.view && viewItem =~ /^changelistFile/",
+          "when": "view == changelists.view && viewItem =~ /^changelistFile(Split)?$/",
           "group": "2_move@2"
         },
         {
@@ -247,6 +270,11 @@
           "command": "changelists.discardChanges",
           "when": "view == changelists.view && viewItem =~ /^changelistFile/",
           "group": "3_destructive@1"
+        },
+        {
+          "command": "changelists.editDescription",
+          "when": "view == changelists.view && viewItem =~ /^changelist(Default)?$/",
+          "group": "2_edit@2"
         }
       ],
       "commandPalette": [
@@ -288,7 +316,33 @@
           "description": "Ask for confirmation before deleting a changelist that still contains files."
         }
       }
-    }
+    },
+    "keybindings": [
+      {
+        "command": "changelists.moveSelectionToChangelist",
+        "key": "ctrl+m",
+        "mac": "cmd+m",
+        "when": "focusedView == changelists.view"
+      },
+      {
+        "command": "changelists.createChangelist",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n",
+        "when": "focusedView == changelists.view"
+      },
+      {
+        "command": "changelists.openDiff",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "focusedView == changelists.view"
+      },
+      {
+        "command": "changelists.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "focusedView == changelists.view && changelists.canUndo"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "node esbuild.js --production",
@@ -298,7 +352,7 @@
     "compile:emit": "tsc -p ./",
     "lint": "eslint src --ext ts",
     "pretest": "npm run compile && npm run lint",
-    "test": "npm run test:unit",
+    "test": "npm run compile && npm run lint && npm run test:unit",
     "test:unit": "npm run compile:emit && node --test \"out/test/unit/**/*.test.js\"",
     "test:integration": "npm run compile:emit && npm run build && node ./out/test/runTest.js",
     "package": "vsce package"
@@ -309,7 +363,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
-    "@vscode/test-electron": "^2.3.9",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^2.24.0",
     "esbuild": "^0.20.0",
     "eslint": "^8.56.0",
@@ -317,7 +371,17 @@
     "mocha": "^10.3.0",
     "typescript": "^5.3.3"
   },
-  "dependencies": {
-    "simple-git": "^3.22.0"
-  }
+  "keywords": [
+    "changelist",
+    "changelists",
+    "git",
+    "scm",
+    "source control",
+    "shelve",
+    "jetbrains",
+    "webstorm",
+    "intellij",
+    "partial commit"
+  ],
+  "qna": false
 }

@@ -19,7 +19,6 @@ import type { Status } from './gitStatus';
 export interface Change {
   readonly uri: Uri;
   readonly originalUri: Uri;
-  readonly renameUri: Uri | undefined;
   readonly status: Status;
 }
 

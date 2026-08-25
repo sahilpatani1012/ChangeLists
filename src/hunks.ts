@@ -1,5 +1,4 @@
 import { createHash } from 'crypto';
-import { RepoRelativePath } from './types';
 
 /** Unified-diff parsing and subset-patch generation for hunk-level changelists
  *  (PRD §10 v2). Pure functions over strings — no `vscode`, no `git`, no I/O — so the
@@ -76,6 +75,13 @@ export function parseUnifiedDiff(diff: string): ParsedDiff | undefined {
     i++;
     while (i < lines.length && !HUNK_HEADER.test(lines[i])) {
       const line = lines[i];
+      // A second file's header ends this one. Every caller diffs a single path, so this
+      // should not arise — but swallowing it into the previous hunk's body would produce a
+      // subset patch silently carrying another file's content, which is worse than
+      // refusing to parse past it.
+      if (line.startsWith('diff --git ')) {
+        return hunks.length > 0 ? { header, hunks } : undefined;
+      }
       // A trailing empty string from the final "\n" split isn't part of the hunk.
       if (line === '' && i === lines.length - 1) {
         i++;
@@ -127,7 +133,10 @@ export function buildSubsetPatch(parsed: ParsedDiff, selectedIds: ReadonlySet<st
   const out: string[] = [parsed.header];
   let delta = 0;
   for (const hunk of selected) {
-    const newStart = hunk.oldStart + delta;
+    // `-0,0` marks an insertion before the first line; its `+` side still starts at 1, and
+    // a naive `oldStart + delta` would emit `+0`, which git rejects. Only reachable with
+    // zero context, which is why -U3 has kept this out of sight rather than out of scope.
+    const newStart = hunk.oldStart === 0 ? Math.max(1, 1 + delta) : hunk.oldStart + delta;
     const newCount = hunk.oldCount + (hunk.additions - hunk.deletions);
     out.push(formatHunkHeader(hunk.oldStart, hunk.oldCount, newStart, newCount, hunk.heading));
     out.push(...hunk.lines);
@@ -167,9 +176,31 @@ export function summarizeHunkCounts(hunk: Hunk): string {
   return `+${hunk.additions} −${hunk.deletions}`;
 }
 
-/** A file whose hunks are split across more than one changelist. */
-export interface SplitFileSummary {
-  readonly filePath: RepoRelativePath;
-  readonly ownedHunks: number;
-  readonly totalHunks: number;
+/** Reports why a captured diff could not be handed back to `git apply`, or undefined if
+ *  it looks applicable.
+ *
+ *  This exists for shelving, where the captured patch is the *only* copy of the user's
+ *  work: gitService reverts the working tree immediately after capturing, so a patch that
+ *  silently isn't a patch means the change is gone with nothing to restore. Both failure
+ *  modes below are produced by ordinary user git config rather than by anything exotic —
+ *  see the pinned config in gitService.ts — so the check is cheap insurance against a
+ *  class of bug whose blast radius is "your afternoon's work".
+ *
+ *  An empty diff is *not* a defect: it just means the file matched HEAD after all, and
+ *  unshelvePaths() already skips those. */
+export function describePatchDefect(patch: string): string | undefined {
+  if (patch.trim().length === 0) {
+    return undefined;
+  }
+  if (!patch.startsWith('diff --git ')) {
+    // `color.ui = always` prefixes an ANSI escape; a `diff.external` driver replaces the
+    // output wholesale. Either way this is not something `git apply` can read.
+    return 'git did not emit a plain unified diff';
+  }
+  if (/^Binary files .* differ$/m.test(patch) && !patch.includes('GIT binary patch')) {
+    // The `--binary` flag turns this stub into a literal/delta block. Without it git
+    // reports that the file changed but not *how*, which is unrecoverable.
+    return 'git summarised a binary file instead of encoding its contents';
+  }
+  return undefined;
 }

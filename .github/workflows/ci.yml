@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  check:
+    # The unit suite drives the real `git` binary (see src/test/unit/gitCli.test.ts), so
+    # this matrix is also how we find out whether a git version behaves differently — the
+    # class of bug that produced most of the 1.1.0 fixes.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - run: npm run lint
+      - run: npm run test:unit
+      - run: npm run build
+
+  integration:
+    # Needs a real VS Code, so it is a separate job: a failure here should be legible as
+    # "the extension host disagreed", not mixed in with a type error.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: xvfb-run -a npm run test:integration

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { errorMessage, resolveChangelistTarget } from './shared';
+import { autoAssignSetting, errorMessage, isActionable, resolveChangelistTarget } from './shared';
 import { buildSubsetPatch, parseUnifiedDiff } from '../hunks';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 
@@ -19,16 +19,35 @@ export async function commitChangelistCommand(
   provider: ChangelistsTreeDataProvider,
   node?: ChangelistTreeNode
 ): Promise<void> {
-  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to commit');
+  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to commit', {
+    filter: isActionable,
+    reject: (c) => `"${c.name}" is shelved — unshelve it before committing.`,
+    empty: 'Changelists: every changelist is shelved. Unshelve one to commit it.',
+  });
   if (!target) {
     return;
   }
   const { context, changelist } = target;
 
-  const grouped = context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex);
-  const entries = grouped.get(changelist.id) ?? [];
+  // Re-read status before building the file set: `liveChanges` is only as fresh as the
+  // last git event, and this command then walks the user through two or three prompts
+  // before committing. Committing a stale path fails with git's own "pathspec did not
+  // match", which reads like a bug in the extension rather than a race.
+  await context.refreshLiveChanges(autoAssignSetting());
+
+  const entries = context.grouped.get(changelist.id) ?? [];
   if (entries.length === 0) {
     void vscode.window.showInformationMessage(`"${changelist.name}" has no files to commit.`);
+    return;
+  }
+
+  const conflicted = entries.filter((e) => e.conflicted);
+  if (conflicted.length > 0) {
+    void vscode.window.showErrorMessage(
+      `"${changelist.name}" contains ${
+        conflicted.length === 1 ? `an unresolved merge conflict in "${conflicted[0].filePath}"` : `${conflicted.length} unresolved merge conflicts`
+      }. Resolve ${conflicted.length === 1 ? 'it' : 'them'} before committing.`
+    );
     return;
   }
 
@@ -102,7 +121,9 @@ export async function commitChangelistCommand(
         const scopedFiles = await Promise.all(
           entries.map(async (e) => {
             if (!e.split || e.split.ownedHunks === e.split.totalHunks) {
-              return { filePath: e.filePath };
+              // renamedFrom rides along so this path stages the old path's removal too —
+              // the pathspec path gets that for free via `paths`, this one doesn't.
+              return { filePath: e.filePath, renamedFrom: e.renamedFrom };
             }
             const parsed = parseUnifiedDiff(await context.repo.getFileDiff(e.filePath));
             const patch = parsed ? buildSubsetPatch(parsed, new Set(e.split.hunkIds)) : undefined;
@@ -118,10 +139,7 @@ export async function commitChangelistCommand(
       }
     );
     void vscode.window.showInformationMessage(`Committed ${scopeNote} to "${changelist.name}".`);
-    const autoAssignToActive = vscode.workspace
-      .getConfiguration('changelists')
-      .get<boolean>('autoAssignNewFilesToActive', true);
-    await context.refreshLiveChanges(autoAssignToActive);
+    await context.refreshLiveChanges(autoAssignSetting());
   } catch (err) {
     void vscode.window.showErrorMessage(`Commit failed: ${errorMessage(err)}`);
   }

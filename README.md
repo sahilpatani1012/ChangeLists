@@ -37,7 +37,11 @@ index so only the owned hunks land in it.
 **Shelving.** *Shelve Changelist* sets a list's work aside and takes it out of your
 working tree; *Unshelve* brings it back, into the same changelist it came from. This is
 the extension's own snapshot, **not** `git stash` — nothing appears in `git stash list`
-and there's no stash ref to renumber underneath you.
+and there's no stash ref to renumber underneath you. Shelved file contents are stored in
+the extension's own workspace storage, never in `.vscode/changelists.json`, so sharing
+that file never publishes your work-in-progress. If an unshelve only partly succeeds,
+what landed stays landed and only the rest stays shelved, so retrying resumes rather than
+replaying.
 
 **Review.** *Review Changelist (Open All Diffs)* opens a diff editor per file, in path
 order, so one changelist's work can be read start to finish.
@@ -45,9 +49,23 @@ order, so one changelist's work can be read start to finish.
 **Reconciliation.** On every refresh, assignments are reconciled against live git
 status: files reverted to HEAD drop out, renamed files carry their changelist across to
 the new path, and anything unrecognised falls back to Default rather than being dropped.
+What moved is recorded in the **Changelists** output channel, so a reshuffle after a
+rebase or branch switch is auditable rather than silent. Files with unresolved merge
+conflicts appear too, marked as such, and a changelist containing one refuses to commit.
+
+**Undo.** *Undo Last Changelist Change* (`Ctrl+Z` / `Cmd+Z` with the view focused)
+reverses the last grouping change you made — a move, rename, create, delete, or reunite.
+One step deep, and it touches grouping only: it can never take back a commit, a discard,
+or a shelve. Reconciliation is excluded, so an ordinary save can't bury the thing you
+wanted back.
 
 **Status bar.** The active changelist is shown next to the branch; click it to switch or
 create one.
+
+**Keyboard.** With the Changelists view focused: `Ctrl+M` / `Cmd+M` moves the selection to
+another changelist, `Ctrl+Alt+N` / `Cmd+Alt+N` creates one, and `Ctrl+Enter` / `Cmd+Enter`
+opens the diff. Everything else is on the Command Palette under `Changelists:`. Open File,
+Open Diff and Discard Changes all act on a multi-selection.
 
 ## Installing
 
@@ -57,7 +75,8 @@ Grab the packaged `changelists-1.0.0.vsix` and either:
 - **From a terminal**: `code --install-extension changelists-1.0.0.vsix`
 
 Requires VS Code 1.85+, the built-in Git extension enabled, and `git` on your `PATH`
-(the extension shells out for staging, commit, diff, and patch application).
+(the extension shells out for staging, commit, diff, and patch application; if git is
+missing it says so rather than failing obscurely).
 
 ## Configuration
 
@@ -80,7 +99,12 @@ guessing a winner. External changes (a `git pull`, a branch switch) are picked u
 automatically.
 
 `workspaceState` remains the default because it's per-machine and sidesteps the question
-entirely.
+entirely. Switching between the two carries your existing changelists across; a repository
+that already has state in the destination is left alone.
+
+Shelved file *contents* are never written to this file — only the fact that a changelist
+is shelved and which paths it holds. Contents live in the extension's workspace storage,
+so a changelist shelved on one machine cannot be unshelved on another.
 
 ## Known limitations
 
@@ -98,9 +122,15 @@ These are deliberate boundaries, not bugs waiting to be found:
   the hunks first.
 - **A shelved rename's pre-rename path** is restored from HEAD while shelved and deleted
   again on unshelve, so edits made to that path *while shelved* don't survive.
+- **Shelving refuses files over 16 MB.** The contents are copied into extension storage
+  and read back whole on unshelve; move the file to another changelist to shelve the rest.
+- **Shelves don't travel between machines.** Their contents are deliberately kept out of
+  the shareable state file.
 - **The commit form is native QuickInputs**, not a webview: single-line message, with
-  amend offered as a follow-up pick. Functionally complete, visually plainer than the
-  design mockup's dedicated commit panel.
+  amend offered as a follow-up pick. A multi-paragraph body would need either a custom
+  `SourceControlInputBox` or a webview, so it is a feature rather than a fix.
+- **Splitting needs a repository with at least one commit.** Every diff is taken against
+  HEAD, which doesn't resolve on an unborn branch.
 
 ## Project layout
 
@@ -112,10 +142,15 @@ src/
   hunks.ts                    — unified-diff parsing, hunk identity, subset-patch generation
   gitService.ts               — status via vscode.git's API; commit/shelve/diff via git CLI
   persistence.ts              — workspaceState or .vscode/changelists.json, with conflict handling
+  stateFile.ts                 — serialization + repair of persisted state; vscode-free, unit-tested
+  shelfStore.ts                — shelved file payloads, kept out of the shareable state file
+  scheduling.ts                — debounce + single-flight primitives shared by refresh and persist
   repositoryContext.ts        — per-repo bundle of {repo, manager, live status, hunk index}
   treeDataProvider.ts          — the Changelists tree, with signature-diffed granular refresh
   dragAndDropController.ts    — file → changelist drag-and-drop
   statusBar.ts                 — active-changelist indicator
+  log.ts                        — the Changelists output channel
+  gitCli.ts                     — the only process spawn: git, with pinned config, stdin patches
   api/                          — trimmed vscode.git type declarations + its Status enum
   commands/                     — one module per user-facing action
   test/
@@ -129,7 +164,7 @@ src/
 npm install
 npm run compile      # type-check
 npm run lint
-npm run test:unit    # 39 tests, plain Node — no VS Code binary needed
+npm run test:unit    # 105 tests, plain Node — no VS Code binary needed
 npm run build        # esbuild bundle -> dist/extension.js
 npm run package      # -> changelists-1.0.0.vsix
 ```
@@ -140,15 +175,22 @@ Press <kbd>F5</kbd> to launch an Extension Development Host with the extension l
 ### Testing
 
 `npm run test:unit` covers the parts worth proving in isolation: reconciliation
-(rename carry-over, dropped assignments, shelve/unshelve round-trips) and the hunk
-line-number arithmetic that makes subset patches apply cleanly. It has no `vscode`
+(rename carry-over, dropped assignments, shelve/unshelve round-trips), row-level moves
+(a split file's share versus the whole file), state-file repair, the debounce/coalescing
+primitives, and the hunk line-number arithmetic that makes subset patches apply cleanly. It has no `vscode`
 dependency, so it runs anywhere with Node 18+.
 
-`npm run test:integration` drives a real VS Code instance via `@vscode/test-electron`.
-It needs to download a VS Code build on first run, so it isn't part of the default
-`npm test`. The suite currently covers activation and command registration; extending it
-to the tree view and commit flow needs a fixture repo passed via `runTests({ launchArgs
-})` in `src/test/runTest.ts`.
+`npm run test:integration` drives a real VS Code instance via `@vscode/test-electron`,
+against a throwaway git repository built by `src/test/runTest.ts` — with a modified file,
+an untracked file, and a real `git mv`. It covers what no unit test can reach: what
+`vscode.git` actually reports, above all that a rename puts the **new** path in
+`Change.uri` and the old one in `originalUri`, which the whole rename carry-over depends
+on. It downloads a VS Code build on first run, so it isn't part of `npm test`.
+
+If you run it from VS Code's own integrated terminal, note that `runTest.ts` explicitly
+clears `ELECTRON_RUN_AS_NODE`: the parent process sets it, and inheriting it makes the
+VS Code being spawned behave like plain Node and fail with a `MODULE_NOT_FOUND` that says
+nothing about the real cause.
 
 ## Design reference
 

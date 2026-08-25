@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSubsetPatch, describeHunk, parseUnifiedDiff } from '../../hunks';
+import { buildSubsetPatch, describeHunk, describePatchDefect, parseUnifiedDiff } from '../../hunks';
 
 /** A three-hunk diff of a single file. Hunk sizes deliberately differ (+2/-0, +0/-1,
  *  +1/-1) so the subset-patch line arithmetic has something real to get wrong. */
@@ -168,4 +168,46 @@ test('describeHunk prefers git\'s section heading and falls back to the first ch
   );
   assert.ok(headless);
   assert.equal(describeHunk(headless.hunks[0]), 'the new line');
+});
+
+// ---- shelve capture validation -------------------------------------------------------
+
+test('describePatchDefect accepts a normal text patch and an empty diff', () => {
+  assert.equal(describePatchDefect(THREE_HUNK_DIFF), undefined);
+  // No difference from HEAD is not a defect — unshelvePaths() skips these.
+  assert.equal(describePatchDefect(''), undefined);
+  assert.equal(describePatchDefect('  \n'), undefined);
+});
+
+test('describePatchDefect rejects the content-free binary stub git emits without --binary', () => {
+  const stub = [
+    'diff --git a/img.bin b/img.bin',
+    'index 8f3bbb1..602f867 100644',
+    'Binary files a/img.bin and b/img.bin differ',
+    '',
+  ].join('\n');
+  assert.match(describePatchDefect(stub) ?? '', /binary/i);
+});
+
+test('describePatchDefect accepts a real encoded binary patch', () => {
+  // What `git diff --binary` produces for the same file: restorable, so not a defect.
+  const encoded = [
+    'diff --git a/img.bin b/img.bin',
+    'index 8f3bbb19459ed6bdc6e2869e8f0020b46559c889..6d0d68ac0bd7da420dd4b45664c482bf6becc5fe 100644',
+    'GIT binary patch',
+    'literal 11',
+    'ScmZQzWMX#qaP)I`bpZee<N@&j',
+    '',
+  ].join('\n');
+  assert.equal(describePatchDefect(encoded), undefined);
+});
+
+test('describePatchDefect rejects colorized output from color.ui = always', () => {
+  const colored = '\u001b[1mdiff --git a/t.txt b/t.txt\u001b[m\n\u001b[36m@@ -1 +1 @@\u001b[m\n';
+  assert.match(describePatchDefect(colored) ?? '', /unified diff/);
+});
+
+test('describePatchDefect rejects output that is not a diff at all', () => {
+  // What a configured diff.external driver prints instead.
+  assert.match(describePatchDefect('1c1\n< text\n---\n> text2\n') ?? '', /unified diff/);
 });

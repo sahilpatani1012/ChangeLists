@@ -26,10 +26,31 @@ export type ShelvedFile =
       renamedFrom?: RepoRelativePath;
     };
 
+/** What the tree needs to render one shelved row — and nothing more.
+ *
+ *  Kept separate from ShelvedFile because this half lives in ChangelistState, which in
+ *  `file` mode is `.vscode/changelists.json`: a file the README tells teams to commit.
+ *  Patches and base64 file contents have no business in a shared, committed artifact —
+ *  that publishes private work-in-progress into the repository, and anything sensitive
+ *  along with it. The payloads live in the shelf store instead (see shelfStore.ts). */
+export interface ShelvedFileMeta {
+  filePath: RepoRelativePath;
+  kind: ChangeKind;
+  renamedFrom?: RepoRelativePath;
+}
+
 /** Set on a changelist while its contents are shelved. */
 export interface ShelfInfo {
   shelvedAt: string;
-  files: ShelvedFile[];
+  files: ShelvedFileMeta[];
+}
+
+/** Strips a captured payload down to what ChangelistState is allowed to hold. Accepts
+ *  metadata too, so it can be mapped over a mixed array while migrating state written
+ *  before the payloads moved out. */
+export function toShelvedFileMeta(file: ShelvedFileMeta | ShelvedFile): ShelvedFileMeta {
+  const renamedFrom = 'renamedFrom' in file ? file.renamedFrom : undefined;
+  return { filePath: file.filePath, kind: file.kind, ...(renamedFrom ? { renamedFrom } : {}) };
 }
 
 export interface Changelist {
@@ -58,7 +79,35 @@ export interface HunkAssignment {
   changelistId: string;
 }
 
+/** One row as the tree renders it, for moving. A whole file is a row with no `hunkIds`;
+ *  one changelist's share of a split file is a row that names them. See
+ *  ChangelistManager.moveRows() for why the distinction has to survive to the mover. */
+export interface MovableRow {
+  readonly filePath: RepoRelativePath;
+  /** The changelist the row currently sits under. */
+  readonly changelistId: string;
+  /** Present only for a split row: the hunks this row represents. */
+  readonly hunkIds?: readonly string[];
+  /** The file's total hunk count, where the caller knows it, so a selection covering all
+   *  of them is recognised as a whole-file move. */
+  readonly totalHunks?: number;
+}
+
+/** Why a hunk override stopped applying. Only 'hunk-changed' is worth telling the user
+ *  about: the others are the ordinary consequence of an action they just took (committing
+ *  the file, reverting it, deleting the changelist). */
+export type DroppedHunkReason = 'hunk-changed' | 'file-gone' | 'changelist-gone';
+
+export type DroppedHunkAssignment = HunkAssignment & { reason: DroppedHunkReason };
+
+/** Bumped when the persisted shape changes in a way a previous version would misread.
+ *  Written by stateFile.serialize()/normalize(); state without it is pre-versioned (0.x
+ *  through 1.0) and is upgraded on load. */
+export const SCHEMA_VERSION = 2;
+
 export interface ChangelistState {
+  /** Absent in state written before 1.1. */
+  version?: number;
   changelists: Changelist[];
   assignments: ChangelistAssignment[];
   /** Optional for backward compatibility with 0.x persisted state. */
@@ -69,9 +118,14 @@ export interface ChangelistState {
 export interface GitFileChange {
   readonly filePath: RepoRelativePath;
   readonly kind: ChangeKind;
-  /** Present only when kind === 'renamed'; the path it was renamed from. */
+  /** Present only when kind === 'renamed'; the path it was renamed from. A file that was
+   *  renamed and then edited reports `renamed` here rather than `modified` — git's own
+   *  `RM` status — so this stays set through the edit. */
   readonly renamedFrom?: RepoRelativePath;
   readonly staged: boolean;
+  /** Set for a file with unresolved merge conflicts. Such a file can be grouped and shown,
+   *  but not split (its diff describes the conflict) and not committed. */
+  readonly conflicted?: boolean;
 }
 
 /** A file as it will be rendered under a changelist group in the tree. When a file's
@@ -82,6 +136,7 @@ export interface ChangelistFileEntry {
   readonly kind: ChangeKind;
   readonly renamedFrom?: RepoRelativePath;
   readonly staged: boolean;
+  readonly conflicted?: boolean;
   readonly changelistId: string;
   /** Present only for files whose hunks are split across multiple changelists. */
   readonly split?: {
@@ -111,7 +166,7 @@ export function createEmptyState(defaultListName: string): ChangelistState {
     isDefault: true,
     isActive: true,
   };
-  return { changelists: [defaultList], assignments: [], hunkAssignments: [] };
+  return { version: SCHEMA_VERSION, changelists: [defaultList], assignments: [], hunkAssignments: [] };
 }
 
 /** Maps each file that currently has a diff to the ids of the hunks it contains, in

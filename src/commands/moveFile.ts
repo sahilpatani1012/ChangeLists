@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { createChangelistCommand } from './createChangelist';
+import { errorMessage, refreshAfterHunkChange, toMovableRows } from './shared';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode, FileNode } from '../treeDataProvider';
 
 const NEW_LIST = Symbol('new-list');
@@ -22,13 +23,31 @@ export async function moveSelectionToChangelistCommand(
     return;
   }
   const context = fileNodes[0].context;
+  // A multi-root workspace renders one node per repository, and ctrl+click spans them
+  // freely — so this really can happen. Every path would otherwise be assigned into the
+  // first repo's manager, where it matches nothing and is dropped on the next reconcile.
+  if (fileNodes.some((n) => n.context !== context)) {
+    void vscode.window.showWarningMessage(
+      'Changelists: select files from one repository at a time — changelists are per-repository.'
+    );
+    return;
+  }
+
+  // Where the selection currently lives, so the picker can say so rather than offering a
+  // move that would be a no-op. With a mixed selection nothing is marked.
+  const sourceIds = new Set(fileNodes.map((n) => n.changelist.id));
+  const currentId = sourceIds.size === 1 ? [...sourceIds][0] : undefined;
 
   type Item = vscode.QuickPickItem & { changelistId: string | typeof NEW_LIST };
-  const items: Item[] = context.manager.getChangelists().map((c) => ({
-    label: c.name,
-    description: c.isActive ? 'active' : undefined,
-    changelistId: c.id,
-  }));
+  const items: Item[] = context.manager
+    // A shelved list has no working tree behind it; moveRows() would reject the move.
+    .getChangelists()
+    .filter((c) => !c.shelf)
+    .map((c) => ({
+      label: c.name,
+      description: c.id === currentId ? 'current' : c.isActive ? 'active' : undefined,
+      changelistId: c.id,
+    }));
   items.push({ label: '$(add) New Changelist…', changelistId: NEW_LIST });
 
   const fileWord = fileNodes.length === 1 ? 'file' : 'files';
@@ -51,8 +70,16 @@ export async function moveSelectionToChangelistCommand(
     targetId = picked.changelistId;
   }
 
-  context.manager.assignFiles(
-    fileNodes.map((n) => n.entry.filePath),
-    targetId
-  );
+  const rows = toMovableRows(fileNodes);
+  try {
+    // moveRows, not assignFiles: a row showing "2/5 hunks" represents that share of the
+    // file, and moving it must move those hunks rather than relocating the whole file.
+    context.manager.moveRows(rows, targetId);
+  } catch (err) {
+    void vscode.window.showErrorMessage(errorMessage(err));
+    return;
+  }
+  if (rows.some((r) => r.hunkIds?.length)) {
+    await refreshAfterHunkChange(context);
+  }
 }

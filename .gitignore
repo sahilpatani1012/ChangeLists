@@ -1,6 +1,6 @@
-out/
-dist/
-node_modules/
+*.log
 *.vsix
 .vscode-test/
-*.log
+dist/
+node_modules/
+out/

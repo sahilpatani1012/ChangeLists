@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { errorMessage, resolveChangelistTarget } from './shared';
+import { errorMessage, isActionable, resolveChangelistTarget } from './shared';
 import { ChangelistsTreeDataProvider, ChangelistTreeNode } from '../treeDataProvider';
 
 /** Rough cap on how many diff editors we'll open in one go. Past this, opening them all
@@ -18,20 +18,17 @@ export async function reviewChangelistCommand(
   provider: ChangelistsTreeDataProvider,
   node?: ChangelistTreeNode
 ): Promise<void> {
-  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to review');
+  const target = await resolveChangelistTarget(provider, node, 'Select a changelist to review', {
+    filter: isActionable,
+    reject: (c) => `"${c.name}" is shelved — unshelve it to review its changes.`,
+    empty: 'Changelists: every changelist is shelved. Unshelve one to review it.',
+  });
   if (!target) {
     return;
   }
   const { context, changelist } = target;
 
-  if (changelist.shelf) {
-    void vscode.window.showInformationMessage(
-      `"${changelist.name}" is shelved — unshelve it to review its changes.`
-    );
-    return;
-  }
-
-  const entries = (context.manager.getFilesGroupedByChangelist(context.liveChanges, context.hunkIndex).get(changelist.id) ?? [])
+  const entries = (context.grouped.get(changelist.id) ?? [])
     .slice()
     .sort((a, b) => a.filePath.localeCompare(b.filePath));
 
