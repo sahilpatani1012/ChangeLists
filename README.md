@@ -1,5 +1,7 @@
 # Changelists
 
+[![CI](https://github.com/sahilpatani1012/ChangeLists/actions/workflows/ci.yml/badge.svg)](https://github.com/sahilpatani1012/ChangeLists/actions/workflows/ci.yml)
+
 JetBrains/WebStorm-style named changelists for VS Code: group your modified files into
 named sets and commit each one independently, without your other in-progress work
 bleeding into the same commit.
@@ -69,10 +71,10 @@ Open Diff and Discard Changes all act on a multi-selection.
 
 ## Installing
 
-Grab the packaged `changelists-1.0.0.vsix` and either:
+Build the package with `npm run package`, then either:
 
 - **In VS Code**: Extensions view (`Ctrl+Shift+X`) → `...` menu → *Install from VSIX…*
-- **From a terminal**: `code --install-extension changelists-1.0.0.vsix`
+- **From a terminal**: `code --install-extension changelists-1.1.0.vsix`
 
 Requires VS Code 1.85+, the built-in Git extension enabled, and `git` on your `PATH`
 (the extension shells out for staging, commit, diff, and patch application; if git is
@@ -159,6 +161,15 @@ src/
 ```
 
 ## Development
+
+### Publishing
+
+`package.json` still carries a placeholder `publisher` (`changelists-dev`). A VS Code
+Marketplace publisher ID has to be registered at
+[marketplace.visualstudio.com](https://marketplace.visualstudio.com/manage), and `vsce publish`
+will reject the placeholder — set it to your own before publishing. Everything else the
+Marketplace listing needs (icon, repository, issues, homepage, keywords, banner) is in place,
+and `vsce package` runs without warnings.
 
 ```
 npm install
